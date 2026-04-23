@@ -7,7 +7,7 @@
   "description": "Organize browsing into named, persistent collections of tabs mapped to dedicated browser windows.",
   "browser_specific_settings": {
     "gecko": {
-      "id": "workspaces-v1@cambrant",
+      "id": "workspaces-51f0@cambrant",
       "data_collection_permissions": {
         "required": ["none"]
       }
