@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- List view -->
+  <div id="list-view">
+    <div class="header">
+      <h1>Workspaces</h1>
+      <div class="header-actions">
+        <button id="btn-new" class="icon-btn" title="New workspace">
+          <span class="icon icon-plus"></span>
+        </button>
+        <div class="options-wrapper">
+          <button id="btn-options" class="icon-btn" title="Options">
+            <span class="icon icon-menu"></span>
+          </button>
+          <div id="options-dropdown" class="dropdown hidden">
+            <button id="opt-capture">Save tabs to workspace</button>
+            <button id="opt-export">Export</button>
+            <button id="opt-restore">Restore from backup</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="active-bar" id="active-bar">
+      <div class="active-info">
+        <span class="active-dot" id="active-dot"></span>
+        <span class="active-name" id="active-name">No workspace</span>
+      </div>
+      <button id="btn-reorder" class="icon-btn reorder-btn" title="Reorder workspaces">
+        <span class="icon icon-move" id="reorder-icon"></span>
+      </button>
+    </div>
+
+    <div class="collection-list" id="collection-list"></div>
+  </div>
+
+  <!-- Form view -->
+  <div id="form-view" class="hidden">
+    <div class="form-header">
+      <h2 id="form-title">New Workspace</h2>
+    </div>
+    <div class="form-body">
+      <label for="input-name">Name</label>
+      <input type="text" id="input-name" placeholder="Workspace name" maxlength="50" autocomplete="off">
+
+      <label>Color</label>
+      <div class="color-picker" id="color-picker"></div>
+
+      <div class="form-actions">
+        <button id="btn-cancel" class="btn-secondary">Cancel</button>
+        <button id="btn-confirm" class="btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirmation modal -->
+  <div id="delete-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3>Delete "<span id="delete-name"></span>"?</h3>
+      <p>This action cannot be undone. All saved tabs and groups will be permanently removed.</p>
+      <div class="modal-actions">
+        <button id="btn-delete-cancel" class="btn-secondary">Cancel</button>
+        <button id="btn-delete-confirm" class="btn-danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

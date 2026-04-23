@@ -1,0 +1,49 @@
+{
+  "manifest_version": 2,
+  "author": "cambrant",
+  "homepage_url": "https://github.com/cambrant/workspaces",
+  "name": "Workspaces",
+  "version": "0.1",
+  "description": "Organize browsing into named, persistent collections of tabs mapped to dedicated browser windows.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "workspaces@cambrant",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": [
+    "tabs",
+    "tabHide",
+    "storage",
+    "activeTab",
+    "menus",
+    "contextualIdentities",
+    "cookies"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "48": "icons/icon.svg",
+      "96": "icons/icon.svg"
+    },
+    "default_title": "Workspaces"
+  },
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "commands": {
+    "switch-to-previous-workspace": {
+      "suggested_key": {
+        "default": "Ctrl+Comma",
+        "mac": "MacCtrl+Comma"
+      },
+      "description": "Switch to the previous workspace"
+    }
+  }
+}

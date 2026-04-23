@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Restore Workspaces</title>
+  <link rel="stylesheet" href="restore.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Restore from Backup</h1>
+      <button id="btn-close" class="icon-btn" title="Close">
+        <span class="icon icon-close"></span>
+      </button>
+    </div>
+
+    <div id="drop-zone" class="drop-zone">
+      <div class="drop-zone-content">
+        <p class="drop-zone-label">Click to select a file or drag and drop</p>
+        <p class="drop-zone-hint">.json backup file</p>
+      </div>
+    </div>
+
+    <div id="status" class="status hidden"></div>
+  </div>
+
+  <!-- Confirmation Modal -->
+  <div id="confirm-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3>Restore Backup?</h3>
+      <p>All current data will be <strong>permanently deleted</strong> and replaced with <strong><span id="import-count">0</span> workspaces</strong> from the backup file.</p>
+      <div class="modal-actions">
+        <button id="btn-modal-cancel" class="btn-secondary">Cancel</button>
+        <button id="btn-modal-confirm" class="btn-danger">Restore</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="restore.js"></script>
+</body>
+</html>
