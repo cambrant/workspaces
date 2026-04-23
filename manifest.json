@@ -39,6 +39,13 @@
     "96": "icons/icon.svg"
   },
   "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Comma",
+        "mac": "MacCtrl+Shift+Comma"
+      },
+      "description": "Open the workspaces popup"
+    },
     "switch-to-previous-workspace": {
       "suggested_key": {
         "default": "Ctrl+Comma",

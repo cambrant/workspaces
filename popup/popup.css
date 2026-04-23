@@ -237,6 +237,10 @@ h1, h2, h3 {
   background: var(--bg-hover);
 }
 
+.collection-item.focused {
+  background: var(--primary-light);
+}
+
 .collection-item .color-dot {
   width: 10px;
   height: 10px;

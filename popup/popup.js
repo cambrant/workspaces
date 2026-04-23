@@ -21,6 +21,7 @@ let selectedColor = COLORS[5].hex; // blue default
 let reorderMode = false;
 let deletingId = null;
 let dragSourceIndex = null;
+let focusedIndex = -1;
 
 // Init
 
@@ -29,6 +30,11 @@ async function init() {
   currentWindowId = win.id;
   await loadState();
   renderColorPicker();
+
+  // Set initial focus to active workspace
+  focusedIndex = collections.findIndex(col => getStatus(col) === "active");
+  if (focusedIndex === -1 && collections.length > 0) focusedIndex = 0;
+
   renderList();
   setupEventListeners();
 }
@@ -81,6 +87,24 @@ function renderList() {
 
   for (let i = 0; i < collections.length; i++) {
     list.appendChild(createItem(collections[i], i));
+  }
+
+  // Clamp and apply keyboard focus
+  if (collections.length === 0) {
+    focusedIndex = -1;
+  } else if (focusedIndex >= collections.length) {
+    focusedIndex = collections.length - 1;
+  }
+  updateFocusedItem();
+}
+
+function updateFocusedItem() {
+  const items = document.querySelectorAll(".collection-item");
+  items.forEach((item, i) => {
+    item.classList.toggle("focused", i === focusedIndex);
+  });
+  if (focusedIndex >= 0 && focusedIndex < items.length) {
+    items[focusedIndex].scrollIntoView({ block: "nearest" });
   }
 }
 
@@ -390,6 +414,44 @@ function setupEventListeners() {
     hideDeleteModal();
     await loadState();
     renderList();
+  });
+
+  // Keyboard navigation in list view
+  document.addEventListener("keydown", e => {
+    const listView = document.getElementById("list-view");
+    const deleteModal = document.getElementById("delete-modal");
+
+    if (listView.classList.contains("hidden")) return;
+    if (!deleteModal.classList.contains("hidden")) return;
+    if (reorderMode) return;
+
+    const itemCount = collections.length;
+    if (itemCount === 0) return;
+
+    if (e.key === "ArrowDown" || e.key === "j") {
+      e.preventDefault();
+      focusedIndex = (focusedIndex + 1) % itemCount;
+      updateFocusedItem();
+    } else if (e.key === "ArrowUp" || e.key === "k") {
+      e.preventDefault();
+      focusedIndex = (focusedIndex - 1 + itemCount) % itemCount;
+      updateFocusedItem();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (focusedIndex >= 0 && focusedIndex < itemCount) {
+        const col = collections[focusedIndex];
+        if (getStatus(col) === "active") {
+          window.close();
+        } else {
+          browser.runtime.sendMessage({
+            type: "openCollection",
+            collectionId: col.id,
+            currentWindowId
+          });
+          window.close();
+        }
+      }
+    }
   });
 
   // Reorder toggle
