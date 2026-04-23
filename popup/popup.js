@@ -121,7 +121,7 @@ function createItem(col, index) {
   // Status
   const statusEl = document.createElement("span");
   statusEl.className = `item-status status-${status}`;
-  statusEl.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  statusEl.textContent = status === "active" ? "Active" : "";
   item.appendChild(statusEl);
 
   // Actions
