@@ -1,6 +1,7 @@
 // Constants
 
 const STORAGE_KEY = "collections";
+const DEFAULT_WS_KEY = "defaultWorkspace";
 const DEFAULT_CONTAINER = "firefox-default";
 const NEW_TAB_URL = "about:newtab";
 const HEX_COLOR_RE = /^#([A-Fa-f0-9]{3}){1,2}$/;
@@ -99,12 +100,43 @@ const State = {
   activeTabMap: new Map(),
   previousWorkspaceMap: new Map(),
 
+  _persist() {
+    browser.storage.session.set({
+      _state: {
+        windowMap: Object.fromEntries(this.windowMap),
+        tabOwnership: Object.fromEntries(this.tabOwnership),
+        activeTabMap: Object.fromEntries(this.activeTabMap),
+        previousWorkspaceMap: Object.fromEntries(this.previousWorkspaceMap)
+      }
+    }).catch(() => {});
+  },
+
+  async _loadFromSession() {
+    try {
+      const { _state } = await browser.storage.session.get("_state");
+      if (!_state) return false;
+      if (_state.windowMap)
+        this.windowMap = new Map(Object.entries(_state.windowMap).map(([k, v]) => [Number(k), v]));
+      if (_state.tabOwnership)
+        this.tabOwnership = new Map(Object.entries(_state.tabOwnership).map(([k, v]) => [Number(k), v]));
+      if (_state.activeTabMap)
+        this.activeTabMap = new Map(Object.entries(_state.activeTabMap));
+      if (_state.previousWorkspaceMap)
+        this.previousWorkspaceMap = new Map(Object.entries(_state.previousWorkspaceMap).map(([k, v]) => [Number(k), v]));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+
   link(windowId, collectionId) {
     this.windowMap.set(windowId, collectionId);
+    this._persist();
   },
 
   unlink(windowId) {
     this.windowMap.delete(windowId);
+    this._persist();
   },
 
   lookup(windowId) {
@@ -139,10 +171,12 @@ const State = {
 
   assignTab(tabId, workspaceId) {
     this.tabOwnership.set(tabId, workspaceId);
+    this._persist();
   },
 
   unassignTab(tabId) {
     this.tabOwnership.delete(tabId);
+    this._persist();
   },
 
   getTabsForWorkspace(workspaceId) {
@@ -155,10 +189,25 @@ const State = {
 
   setActiveTab(workspaceId, tabId) {
     this.activeTabMap.set(workspaceId, tabId);
+    this._persist();
   },
 
   getActiveTab(workspaceId) {
     return this.activeTabMap.get(workspaceId) || null;
+  },
+
+  clearActiveTab(workspaceId) {
+    this.activeTabMap.delete(workspaceId);
+    this._persist();
+  },
+
+  setPreviousWorkspace(windowId, workspaceId) {
+    this.previousWorkspaceMap.set(windowId, workspaceId);
+    this._persist();
+  },
+
+  getPreviousWorkspace(windowId) {
+    return this.previousWorkspaceMap.get(windowId) || null;
   }
 };
 
@@ -177,9 +226,9 @@ const Indicator = {
     const svg = this.TEMPLATE.replace(/\{\{COLOR\}\}/g, color).replace("{{LETTER}}", letter);
     const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
     try {
-      await browser.browserAction.setIcon({ path: url, windowId });
-      await browser.browserAction.setTitle({ title: `Workspaces — ${collection.name}`, windowId });
-      await browser.browserAction.setBadgeText({ text: "", windowId });
+      await browser.action.setIcon({ path: url, windowId });
+      await browser.action.setTitle({ title: `Workspaces — ${collection.name}`, windowId });
+      await browser.action.setBadgeText({ text: "", windowId });
     } catch (e) {
       console.warn("Indicator.update failed:", e);
     }
@@ -189,9 +238,9 @@ const Indicator = {
     const svg = this.TEMPLATE.replace(/\{\{COLOR\}\}/g, DEFAULT_COLOR);
     const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
     try {
-      await browser.browserAction.setIcon({ path: url, windowId });
-      await browser.browserAction.setTitle({ title: "Workspaces", windowId });
-      await browser.browserAction.setBadgeText({ text: "", windowId });
+      await browser.action.setIcon({ path: url, windowId });
+      await browser.action.setTitle({ title: "Workspaces", windowId });
+      await browser.action.setBadgeText({ text: "", windowId });
     } catch (e) {
       // Window may be gone
     }
@@ -399,7 +448,7 @@ const Restore = {
 
     // Track the outgoing workspace as the previous one for this window
     if (currentWsId) {
-      State.previousWorkspaceMap.set(windowId, currentWsId);
+      State.setPreviousWorkspace(windowId, currentWsId);
     }
 
     // Save current workspace state before locking
@@ -514,8 +563,10 @@ const Restore = {
     }
 
     if (shouldDiscard) {
-      props.discarded = true;
-      props.title = tabData.title || "";
+      // FIXME: Discarding is disabled for now, as an experiment. Turn back on
+      // if this causes performance issues.
+      // props.discarded = true;
+      // props.title = tabData.title || "";
     }
 
     if (cookieStoreId !== DEFAULT_CONTAINER) {
@@ -594,7 +645,8 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
       for (const [wid, cid] of State.windowMap) {
         windowMap[wid] = cid;
       }
-      return { collections, windowMap };
+      const { [DEFAULT_WS_KEY]: defaultWorkspace } = await browser.storage.local.get(DEFAULT_WS_KEY);
+      return { collections, windowMap, defaultWorkspace: defaultWorkspace || null };
     }
 
     case "createCollection": {
@@ -681,8 +733,15 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
         try { await browser.tabs.remove(ownedTabIds); } catch (e) { /* gone */ }
       }
 
-      State.activeTabMap.delete(msg.collectionId);
+      State.clearActiveTab(msg.collectionId);
       await Storage.delete(msg.collectionId);
+
+      // Clear default if this was the default workspace
+      const { [DEFAULT_WS_KEY]: defaultWsId } = await browser.storage.local.get(DEFAULT_WS_KEY);
+      if (defaultWsId === msg.collectionId) {
+        await browser.storage.local.remove(DEFAULT_WS_KEY);
+      }
+
       await Menus.rebuild();
       return { ok: true };
     }
@@ -698,6 +757,15 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
       await browser.storage.local.set({ [STORAGE_KEY]: all });
       await Menus.rebuild();
       return { ok: true, collections: all };
+    }
+
+    case "setDefaultWorkspace": {
+      if (msg.collectionId) {
+        await browser.storage.local.set({ [DEFAULT_WS_KEY]: msg.collectionId });
+      } else {
+        await browser.storage.local.remove(DEFAULT_WS_KEY);
+      }
+      return { ok: true };
     }
 
     case "resyncAfterRestore": {
@@ -716,7 +784,7 @@ browser.commands.onCommand.addListener(async command => {
   if (command !== "switch-to-previous-workspace") return;
 
   const win = await browser.windows.getLastFocused();
-  const previousWsId = State.previousWorkspaceMap.get(win.id);
+  const previousWsId = State.getPreviousWorkspace(win.id);
 
   if (!previousWsId) return;
 
@@ -736,7 +804,8 @@ async function hydrate() {
   _hydrating = true;
 
   try {
-    State.reset();
+    // Try restoring in-memory state from session storage (survives suspension)
+    const hadSession = await State._loadFromSession();
 
     const collections = await Storage.readAll();
     const windows = await browser.windows.getAll();
@@ -747,13 +816,13 @@ async function hydrate() {
       await Indicator.clear(win.id);
     }
 
+    // Rebuild windowMap from storage (authoritative source for window linkage)
+    State.windowMap.clear();
     let changed = false;
     for (const col of collections) {
       if (col.windowId != null) {
         if (windowIds.has(col.windowId)) {
-          State.link(col.windowId, col.id);
-          const tabs = await browser.tabs.query({ windowId: col.windowId, hidden: false });
-          for (const tab of tabs) State.assignTab(tab.id, col.id);
+          State.windowMap.set(col.windowId, col.id);
           EventBus.emit("windowLinked", { windowId: col.windowId, collectionId: col.id });
         } else {
           col.windowId = null;
@@ -766,15 +835,109 @@ async function hydrate() {
       await browser.storage.local.set({ [STORAGE_KEY]: collections });
     }
 
-    // Clean up orphaned hidden tabs from previous sessions
-    for (const win of windows) {
-      const hiddenTabs = await browser.tabs.query({ windowId: win.id, hidden: true });
-      if (hiddenTabs.length > 0) {
-        try { await browser.tabs.remove(hiddenTabs.map(t => t.id)); } catch (e) { /* gone */ }
+    // Rebuild tabOwnership: visible tabs derive from windowMap
+    const freshOwnership = new Map();
+    for (const [windowId, collectionId] of State.windowMap) {
+      const visibleTabs = await browser.tabs.query({ windowId, hidden: false });
+      for (const tab of visibleTabs) {
+        freshOwnership.set(tab.id, collectionId);
       }
     }
 
+    if (hadSession) {
+      // Warm wake: restore hidden-tab ownership from session data
+      for (const [tabId, wsId] of State.tabOwnership) {
+        if (!freshOwnership.has(tabId)) {
+          try {
+            await browser.tabs.get(tabId);
+            freshOwnership.set(tabId, wsId);
+          } catch (e) {
+            // Tab no longer exists
+          }
+        }
+      }
+      State.tabOwnership = freshOwnership;
+
+      // Prune stale window entries from previousWorkspaceMap
+      for (const [wid] of State.previousWorkspaceMap) {
+        if (!windowIds.has(wid)) State.previousWorkspaceMap.delete(wid);
+      }
+
+      // Prune stale workspace entries from activeTabMap
+      const collectionIds = new Set(collections.map(c => c.id));
+      for (const [wsId] of State.activeTabMap) {
+        if (!collectionIds.has(wsId)) State.activeTabMap.delete(wsId);
+      }
+    } else {
+      // Cold start: no session data available
+      State.tabOwnership = freshOwnership;
+      State.activeTabMap.clear();
+      State.previousWorkspaceMap.clear();
+
+      // Clean orphaned hidden tabs only on cold start
+      for (const win of windows) {
+        const hiddenTabs = await browser.tabs.query({ windowId: win.id, hidden: true });
+        if (hiddenTabs.length > 0) {
+          try { await browser.tabs.remove(hiddenTabs.map(t => t.id)); } catch (e) { /* gone */ }
+        }
+      }
+    }
+
+    State._persist();
     await Menus.rebuild();
+
+    // First-install setup: create default workspace from current window
+    const { _setupDone } = await browser.storage.local.get("_setupDone");
+    if (!_setupDone) {
+      await browser.storage.local.set({ _setupDone: true });
+
+      const win = windows.find(w => w.focused) || windows[0];
+      if (win) {
+        const tabs = await browser.tabs.query({ windowId: win.id, hidden: false });
+        const tabList = tabs.map(tab => ({
+          url: tab.url || "",
+          title: tab.title || "",
+          pinned: !!tab.pinned,
+          focused: !!tab.active,
+          cookieStoreId: tab.cookieStoreId || DEFAULT_CONTAINER
+        }));
+
+        const id = generateId();
+        const collection = {
+          id,
+          name: "Default",
+          color: "#0060df",
+          tabs: tabList,
+          groups: [],
+          windowId: win.id,
+          createdAt: Date.now()
+        };
+
+        await Storage.upsert(collection);
+        await browser.storage.local.set({ [DEFAULT_WS_KEY]: id });
+
+        State.link(win.id, id);
+        for (const tab of tabs) {
+          State.assignTab(tab.id, id);
+        }
+        State._persist();
+
+        EventBus.emit("windowLinked", { windowId: win.id, collectionId: id });
+        await Menus.rebuild();
+      }
+    } else {
+      // Auto-open default workspace in unlinked windows
+      const { [DEFAULT_WS_KEY]: defaultWsId } = await browser.storage.local.get(DEFAULT_WS_KEY);
+      if (defaultWsId) {
+        const defaultCol = collections.find(c => c.id === defaultWsId);
+        if (defaultCol && State.getWindowForCollection(defaultWsId) === null) {
+          const unlinkedWindows = windows.filter(w => !State.lookup(w.id));
+          if (unlinkedWindows.length > 0) {
+            await Restore.switchInWindow(unlinkedWindows[0].id, defaultCol);
+          }
+        }
+      }
+    }
   } finally {
     _hydrating = false;
   }
@@ -789,3 +952,7 @@ Capture.init();
 browser.runtime.onStartup.addListener(hydrate);
 browser.runtime.onInstalled.addListener(hydrate);
 hydrate();
+
+// Alarm keepalive: prevents event page suspension
+browser.alarms.create("keepalive", { periodInMinutes: 0.4 });
+browser.alarms.onAlarm.addListener(() => {});

@@ -14,6 +14,7 @@ const COLORS = [
 let collections = [];
 let currentWindowId = null;
 let windowMap = {};
+let defaultWorkspace = null;
 let formMode = null;    // "new" | "capture" | "edit"
 let editingId = null;
 let selectedColor = COLORS[5].hex; // blue default
@@ -36,6 +37,7 @@ async function loadState() {
   const state = await browser.runtime.sendMessage({ type: "getState" });
   collections = state.collections || [];
   windowMap = state.windowMap || {};
+  defaultWorkspace = state.defaultWorkspace || null;
 }
 
 // Status
@@ -107,6 +109,14 @@ function createItem(col, index) {
   name.className = "item-name";
   name.textContent = col.name;
   item.appendChild(name);
+
+  // Default badge
+  if (defaultWorkspace === col.id) {
+    const badge = document.createElement("span");
+    badge.className = "item-default";
+    badge.textContent = "Default";
+    item.appendChild(badge);
+  }
 
   // Status
   const statusEl = document.createElement("span");
@@ -279,22 +289,27 @@ function showFormView(mode, col) {
   const confirmBtn = document.getElementById("btn-confirm");
   const input = document.getElementById("input-name");
 
+  const defaultCheckbox = document.getElementById("input-default");
+
   if (mode === "edit" && col) {
     editingId = col.id;
     input.value = col.name;
     selectColor(col.color);
+    defaultCheckbox.checked = defaultWorkspace === col.id;
     titleEl.textContent = "Edit Workspace";
     confirmBtn.textContent = "Save Changes";
   } else if (mode === "capture") {
     editingId = null;
     input.value = "";
     selectColor(COLORS[5].hex);
+    defaultCheckbox.checked = false;
     titleEl.textContent = "Save Window as Workspace";
     confirmBtn.textContent = "Create";
   } else {
     editingId = null;
     input.value = "";
     selectColor(COLORS[5].hex);
+    defaultCheckbox.checked = false;
     titleEl.textContent = "New Workspace";
     confirmBtn.textContent = "Create";
   }
@@ -397,6 +412,8 @@ async function handleFormSubmit() {
     return;
   }
 
+  const isDefault = document.getElementById("input-default").checked;
+
   if (formMode === "edit" && editingId) {
     await browser.runtime.sendMessage({
       type: "updateMetadata",
@@ -404,6 +421,14 @@ async function handleFormSubmit() {
       name,
       color: selectedColor
     });
+
+    // Update default workspace setting
+    if (isDefault) {
+      await browser.runtime.sendMessage({ type: "setDefaultWorkspace", collectionId: editingId });
+    } else if (defaultWorkspace === editingId) {
+      await browser.runtime.sendMessage({ type: "setDefaultWorkspace", collectionId: null });
+    }
+
     showListView();
     await loadState();
     renderList();
