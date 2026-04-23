@@ -3,11 +3,11 @@
   "author": "cambrant",
   "homepage_url": "https://github.com/cambrant/workspaces",
   "name": "Workspaces",
-  "version": "0.1",
+  "version": "0.0.1",
   "description": "Organize browsing into named, persistent collections of tabs mapped to dedicated browser windows.",
   "browser_specific_settings": {
     "gecko": {
-      "id": "workspaces@cambrant",
+      "id": "workspaces-v1@cambrant",
       "data_collection_permissions": {
         "required": ["none"]
       }

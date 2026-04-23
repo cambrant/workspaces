@@ -635,6 +635,69 @@ browser.windows.onRemoved.addListener(async windowId => {
   State.unlink(windowId);
 });
 
+// Reconnect workspace after browser restart
+
+browser.windows.onCreated.addListener(async (win) => {
+  // Let session restore populate the window with tabs
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Skip if already managed (by hydrate or extension-initiated open)
+  if (State.lookup(win.id)) return;
+
+  const collections = await Storage.readAll();
+
+  // Try URL matching against saved workspaces
+  const visibleTabs = await browser.tabs.query({ windowId: win.id, hidden: false });
+  const windowUrls = new Set(visibleTabs.map(t => t.url).filter(u => u && !isNewTabUrl(u)));
+
+  if (windowUrls.size > 0) {
+    let bestCol = null;
+    let bestScore = 0;
+
+    for (const col of collections) {
+      if (State.getWindowForCollection(col.id) !== null) continue;
+      const savedUrls = (col.tabs || []).map(t => t.url).filter(u => u && !isNewTabUrl(u));
+      if (savedUrls.length === 0) continue;
+
+      const matches = savedUrls.filter(url => windowUrls.has(url)).length;
+      const score = matches / savedUrls.length;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCol = col;
+      }
+    }
+
+    if (bestCol && bestScore >= 0.5) {
+      State.link(win.id, bestCol.id);
+      const all = await Storage.readAll();
+      const col = all.find(c => c.id === bestCol.id);
+      if (col) {
+        col.windowId = win.id;
+        await browser.storage.local.set({ [STORAGE_KEY]: all });
+      }
+      for (const tab of visibleTabs) {
+        State.assignTab(tab.id, bestCol.id);
+      }
+      EventBus.emit("windowLinked", { windowId: win.id, collectionId: bestCol.id });
+      return;
+    }
+  }
+
+  // No URL match: open default workspace if this looks like a browser restart
+  // (no other windows are managed, so this isn't a Cmd+N new window)
+  if (State.windowMap.size > 0) return;
+
+  const { [DEFAULT_WS_KEY]: defaultWsId } = await browser.storage.local.get(DEFAULT_WS_KEY);
+  if (!defaultWsId) return;
+
+  const defaultCol = collections.find(c => c.id === defaultWsId);
+  if (!defaultCol) return;
+  if (State.getWindowForCollection(defaultWsId) !== null) return;
+
+  await Restore.switchInWindow(win.id, defaultCol);
+});
+
 // Message handler
 
 browser.runtime.onMessage.addListener(async (msg, _sender) => {
@@ -880,6 +943,50 @@ async function hydrate() {
         if (hiddenTabs.length > 0) {
           try { await browser.tabs.remove(hiddenTabs.map(t => t.id)); } catch (e) { /* gone */ }
         }
+      }
+
+      // Re-link windows to workspaces by matching tab URLs from session restore
+      const unlinkedWindows = windows.filter(w => !State.windowMap.has(w.id));
+      const unlinkedCollections = collections.filter(c => State.getWindowForCollection(c.id) === null);
+      let matched = false;
+
+      for (const win of unlinkedWindows) {
+        const visibleTabs = await browser.tabs.query({ windowId: win.id, hidden: false });
+        const windowUrls = new Set(visibleTabs.map(t => t.url).filter(u => u && !isNewTabUrl(u)));
+        if (windowUrls.size === 0) continue;
+
+        let bestCol = null;
+        let bestScore = 0;
+
+        for (const col of unlinkedCollections) {
+          if (State.getWindowForCollection(col.id) !== null) continue;
+          const savedUrls = (col.tabs || []).map(t => t.url).filter(u => u && !isNewTabUrl(u));
+          if (savedUrls.length === 0) continue;
+
+          const matches = savedUrls.filter(url => windowUrls.has(url)).length;
+          const score = matches / savedUrls.length;
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestCol = col;
+          }
+        }
+
+        if (bestCol && bestScore >= 0.5) {
+          State.link(win.id, bestCol.id);
+          bestCol.windowId = win.id;
+          matched = true;
+
+          for (const tab of visibleTabs) {
+            State.assignTab(tab.id, bestCol.id);
+          }
+
+          EventBus.emit("windowLinked", { windowId: win.id, collectionId: bestCol.id });
+        }
+      }
+
+      if (matched) {
+        await browser.storage.local.set({ [STORAGE_KEY]: collections });
       }
     }
 

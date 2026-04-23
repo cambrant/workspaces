@@ -105,7 +105,7 @@ in-memory `State` if session persistence also fails.
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+,` (Mac: `Ctrl+,`) | Switch to the previous workspace in the current window |
+| `Ctrl+,` | Switch to the previous workspace in the current window |
 
 ## Permissions
 
