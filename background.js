@@ -267,6 +267,11 @@ const Indicator = {
 
 // Context menus
 
+function colorDotIcon(hex) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="6" fill="${sanitizeColor(hex)}"/></svg>`;
+  return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+}
+
 const Menus = {
   async rebuild() {
     await browser.menus.removeAll();
@@ -284,6 +289,7 @@ const Menus = {
         id: `move-tab-${col.id}`,
         parentId: "move-tab-root",
         title: col.name,
+        icons: { "16": colorDotIcon(col.color) },
         contexts: ["tab"]
       });
     }
@@ -296,13 +302,22 @@ const Menus = {
       const collectionId = info.menuItemId.replace("move-tab-", "");
       const targetWindowId = State.getWindowForCollection(collectionId);
 
+      // Collect all highlighted tabs; fall back to just the clicked tab
+      let tabs;
+      try {
+        tabs = await browser.tabs.query({ windowId: tab.windowId, highlighted: true });
+        if (tabs.length === 0) tabs = [tab];
+      } catch (e) {
+        tabs = [tab];
+      }
+
       if (targetWindowId !== null) {
-        // Target workspace is open in a window. Move tab there
+        // Target workspace is open in a window. Move tabs there
         try {
-          await browser.tabs.move(tab.id, { windowId: targetWindowId, index: -1 });
-          await browser.tabs.update(tab.id, { active: true });
+          await browser.tabs.move(tabs.map(t => t.id), { windowId: targetWindowId, index: -1 });
+          await browser.tabs.update(tabs[0].id, { active: true });
         } catch (e) {
-          console.error("Failed to move tab:", e);
+          console.error("Failed to move tabs:", e);
         }
       } else {
         // Target workspace is closed. Save tab data to its storage
@@ -310,18 +325,20 @@ const Menus = {
         const col = collections.find(c => c.id === collectionId);
         if (!col) return;
         col.tabs = col.tabs || [];
-        col.tabs.push({
-          url: tab.url || "",
-          title: tab.title || "",
-          pinned: !!tab.pinned,
-          focused: false,
-          cookieStoreId: tab.cookieStoreId || DEFAULT_CONTAINER
-        });
+        for (const t of tabs) {
+          col.tabs.push({
+            url: t.url || "",
+            title: t.title || "",
+            pinned: !!t.pinned,
+            focused: false,
+            cookieStoreId: t.cookieStoreId || DEFAULT_CONTAINER
+          });
+        }
         await browser.storage.local.set({ [STORAGE_KEY]: collections });
         try {
-          await browser.tabs.remove(tab.id);
+          await browser.tabs.remove(tabs.map(t => t.id));
         } catch (e) {
-          console.error("Failed to remove tab after move:", e);
+          console.error("Failed to remove tabs after move:", e);
         }
       }
     });

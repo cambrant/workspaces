@@ -564,7 +564,7 @@ async function exportData() {
   const date = new Date().toISOString().slice(0, 10);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `backup-${date}.json`;
+  a.download = `workspaces-backup-${date}.json`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
