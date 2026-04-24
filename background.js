@@ -465,6 +465,7 @@ const Restore = {
     const prevVisibleIds = prevVisible.map(t => t.id);
 
     State.acquireLock(windowId);
+    ContainerEnforcer.setSwitching(true);
     let freshlyCreated = false;
 
     try {
@@ -537,6 +538,7 @@ const Restore = {
       if (freshlyCreated) {
         await new Promise(r => setTimeout(r, 1000));
       }
+      ContainerEnforcer.setSwitching(false);
       State.releaseLock(windowId);
       await Capture.captureWindow(windowId);
     }
@@ -709,7 +711,13 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
         windowMap[wid] = cid;
       }
       const { [DEFAULT_WS_KEY]: defaultWorkspace } = await browser.storage.local.get(DEFAULT_WS_KEY);
-      return { collections, windowMap, defaultWorkspace: defaultWorkspace || null };
+      let containers = [];
+      try {
+        containers = await browser.contextualIdentities.query({});
+      } catch (e) {
+        // Containers not available
+      }
+      return { collections, windowMap, defaultWorkspace: defaultWorkspace || null, containers };
     }
 
     case "createCollection": {
@@ -770,6 +778,9 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
 
       if (msg.name !== undefined) col.name = msg.name;
       if (msg.color !== undefined) col.color = sanitizeColor(msg.color);
+      if (msg.defaultContainer !== undefined) {
+        col.defaultContainer = msg.defaultContainer || null;
+      }
 
       await browser.storage.local.set({ [STORAGE_KEY]: all });
       EventBus.emit("metadataChanged", { collection: col });
@@ -844,19 +855,128 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
 // Keyboard commands
 
 browser.commands.onCommand.addListener(async command => {
-  if (command !== "switch-to-previous-workspace") return;
+  if (command === "switch-to-previous-workspace") {
+    const win = await browser.windows.getLastFocused();
+    const previousWsId = State.getPreviousWorkspace(win.id);
+    if (!previousWsId) return;
 
-  const win = await browser.windows.getLastFocused();
-  const previousWsId = State.getPreviousWorkspace(win.id);
+    const collections = await Storage.readAll();
+    const target = collections.find(c => c.id === previousWsId);
+    if (!target) return;
 
-  if (!previousWsId) return;
+    await Restore.switchInWindow(win.id, target);
+    return;
+  }
 
-  const collections = await Storage.readAll();
-  const target = collections.find(c => c.id === previousWsId);
-  if (!target) return;
+  const match = command.match(/^switch-to-workspace-(\d+)$/);
+  if (match) {
+    const index = parseInt(match[1], 10) - 1;
+    const collections = await Storage.readAll();
+    if (index < 0 || index >= collections.length) return;
 
-  await Restore.switchInWindow(win.id, target);
+    const win = await browser.windows.getLastFocused();
+    await Restore.switchInWindow(win.id, collections[index]);
+  }
 });
+
+// Container enforcement
+
+const ContainerEnforcer = {
+  _switching: false,
+  _pending: new Map(),
+
+  setSwitching(val) {
+    this._switching = val;
+  },
+
+  async _redirect(tabId, props, wsId) {
+    try {
+      const newTab = await browser.tabs.create(props);
+      State.assignTab(newTab.id, wsId);
+      await browser.tabs.remove(tabId);
+    } catch (e) {
+      console.warn("ContainerEnforcer: redirect failed:", e);
+    }
+  },
+
+  init() {
+    browser.tabs.onCreated.addListener(async tab => {
+      if (this._switching) return;
+      if (State.isLocked(tab.windowId)) return;
+
+      const wsId = State.lookup(tab.windowId);
+      if (!wsId) return;
+
+      const collections = await Storage.readAll();
+      const col = collections.find(c => c.id === wsId);
+      if (!col || !col.defaultContainer) return;
+
+      // Only redirect tabs in the default (no-container) context.
+      // If the user explicitly chose a container, respect that.
+      if (tab.cookieStoreId !== DEFAULT_CONTAINER) return;
+
+      const url = tab.url || "";
+
+      // about:blank means a pending navigation (e.g. middle-click bookmark).
+      // Defer until onUpdated provides the real URL.
+      if (url === "" || url === "about:blank") {
+        this._pending.set(tab.id, {
+          windowId: tab.windowId,
+          index: tab.index,
+          active: tab.active,
+          pinned: !!tab.pinned,
+          wsId,
+          cookieStoreId: col.defaultContainer
+        });
+        return;
+      }
+
+      const props = {
+        windowId: tab.windowId,
+        index: tab.index,
+        active: tab.active,
+        cookieStoreId: col.defaultContainer
+      };
+
+      if (!isNewTabUrl(url)) {
+        props.url = url;
+      }
+      if (tab.pinned) {
+        props.pinned = true;
+      }
+
+      await this._redirect(tab.id, props, wsId);
+    });
+
+    browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+      const pending = this._pending.get(tabId);
+      if (!pending) return;
+      if (!changeInfo.url || changeInfo.url === "about:blank") return;
+
+      this._pending.delete(tabId);
+
+      const props = {
+        windowId: pending.windowId,
+        index: tab.index,
+        active: tab.active,
+        cookieStoreId: pending.cookieStoreId
+      };
+
+      if (!isNewTabUrl(changeInfo.url)) {
+        props.url = changeInfo.url;
+      }
+      if (pending.pinned) {
+        props.pinned = true;
+      }
+
+      await this._redirect(tabId, props, pending.wsId);
+    });
+
+    browser.tabs.onRemoved.addListener(tabId => {
+      this._pending.delete(tabId);
+    });
+  }
+};
 
 // Initialization
 
@@ -1054,6 +1174,7 @@ async function hydrate() {
 Indicator.init();
 Menus.init();
 Capture.init();
+ContainerEnforcer.init();
 
 // Hydrate on all three triggers
 browser.runtime.onStartup.addListener(hydrate);

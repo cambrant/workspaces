@@ -15,6 +15,7 @@ let collections = [];
 let currentWindowId = null;
 let windowMap = {};
 let defaultWorkspace = null;
+let containers = [];
 let formMode = null;    // "new" | "capture" | "edit"
 let editingId = null;
 let selectedColor = COLORS[5].hex; // blue default
@@ -44,6 +45,7 @@ async function loadState() {
   collections = state.collections || [];
   windowMap = state.windowMap || {};
   defaultWorkspace = state.defaultWorkspace || null;
+  containers = state.containers || [];
 }
 
 // Status
@@ -137,9 +139,20 @@ function createItem(col, index) {
   // Default badge
   if (defaultWorkspace === col.id) {
     const badge = document.createElement("span");
-    badge.className = "item-default";
+    badge.className = "item-badge";
     badge.textContent = "Default";
     item.appendChild(badge);
+  }
+
+  // Container badge
+  if (col.defaultContainer) {
+    const container = containers.find(c => c.cookieStoreId === col.defaultContainer);
+    if (container) {
+      const badge = document.createElement("span");
+      badge.className = "item-badge";
+      badge.textContent = container.name;
+      item.appendChild(badge);
+    }
   }
 
   // Status
@@ -297,6 +310,25 @@ function selectColor(hex) {
   });
 }
 
+function renderContainerPicker(selectedStoreId) {
+  const select = document.getElementById("input-container");
+  select.innerHTML = "";
+
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "None";
+  select.appendChild(none);
+
+  for (const c of containers) {
+    const opt = document.createElement("option");
+    opt.value = c.cookieStoreId;
+    opt.textContent = c.name;
+    select.appendChild(opt);
+  }
+
+  select.value = selectedStoreId || "";
+}
+
 // View management
 
 function showListView() {
@@ -319,6 +351,7 @@ function showFormView(mode, col) {
     editingId = col.id;
     input.value = col.name;
     selectColor(col.color);
+    renderContainerPicker(col.defaultContainer);
     defaultCheckbox.checked = defaultWorkspace === col.id;
     titleEl.textContent = "Edit Workspace";
     confirmBtn.textContent = "Save Changes";
@@ -326,6 +359,7 @@ function showFormView(mode, col) {
     editingId = null;
     input.value = "";
     selectColor(COLORS[5].hex);
+    renderContainerPicker(null);
     defaultCheckbox.checked = false;
     titleEl.textContent = "Save Window as Workspace";
     confirmBtn.textContent = "Create";
@@ -333,6 +367,7 @@ function showFormView(mode, col) {
     editingId = null;
     input.value = "";
     selectColor(COLORS[5].hex);
+    renderContainerPicker(null);
     defaultCheckbox.checked = false;
     titleEl.textContent = "New Workspace";
     confirmBtn.textContent = "Create";
@@ -476,12 +511,15 @@ async function handleFormSubmit() {
 
   const isDefault = document.getElementById("input-default").checked;
 
+  const selectedContainer = document.getElementById("input-container").value || null;
+
   if (formMode === "edit" && editingId) {
     await browser.runtime.sendMessage({
       type: "updateMetadata",
       collectionId: editingId,
       name,
-      color: selectedColor
+      color: selectedColor,
+      defaultContainer: selectedContainer
     });
 
     // Update default workspace setting

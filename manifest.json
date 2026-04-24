@@ -52,6 +52,34 @@
         "mac": "MacCtrl+Comma"
       },
       "description": "Switch to the previous workspace"
+    },
+    "switch-to-workspace-1": {
+      "suggested_key": {
+        "default": "Ctrl+1",
+        "mac": "MacCtrl+1"
+      },
+      "description": "Switch to workspace 1"
+    },
+    "switch-to-workspace-2": {
+      "suggested_key": {
+        "default": "Ctrl+2",
+        "mac": "MacCtrl+2"
+      },
+      "description": "Switch to workspace 2"
+    },
+    "switch-to-workspace-3": {
+      "suggested_key": {
+        "default": "Ctrl+3",
+        "mac": "MacCtrl+3"
+      },
+      "description": "Switch to workspace 3"
+    },
+    "switch-to-workspace-4": {
+      "suggested_key": {
+        "default": "Ctrl+4",
+        "mac": "MacCtrl+4"
+      },
+      "description": "Switch to workspace 4"
     }
   }
 }
