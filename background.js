@@ -302,43 +302,102 @@ const Menus = {
       const collectionId = info.menuItemId.replace("move-tab-", "");
       const targetWindowId = State.getWindowForCollection(collectionId);
 
-      // Collect all highlighted tabs; fall back to just the clicked tab
+      // Collect all highlighted tabs if the right-clicked tab is among them;
+      // otherwise move only the right-clicked tab.
       let tabs;
       try {
-        tabs = await browser.tabs.query({ windowId: tab.windowId, highlighted: true });
-        if (tabs.length === 0) tabs = [tab];
+        const highlighted = await browser.tabs.query({ windowId: tab.windowId, highlighted: true });
+        if (highlighted.some(t => t.id === tab.id)) {
+          tabs = highlighted;
+        } else {
+          tabs = [tab];
+        }
       } catch (e) {
         tabs = [tab];
       }
 
+      const tabIds = tabs.map(t => t.id);
+
       if (targetWindowId !== null) {
-        // Target workspace is open in a window. Move tabs there
+        // Target workspace is open in a window. Lock both windows to suppress
+        // per-tab captureWindow calls during the bulk move.
+        State.acquireLock(tab.windowId);
+        State.acquireLock(targetWindowId);
         try {
-          await browser.tabs.move(tabs.map(t => t.id), { windowId: targetWindowId, index: -1 });
-          await browser.tabs.update(tabs[0].id, { active: true });
+          await browser.tabs.move(tabIds, { windowId: targetWindowId, index: -1 });
+          for (const id of tabIds) {
+            State.assignTab(id, collectionId);
+          }
+          await browser.tabs.update(tabIds[0], { active: true });
         } catch (e) {
           console.error("Failed to move tabs:", e);
+        } finally {
+          State.releaseLock(tab.windowId);
+          State.releaseLock(targetWindowId);
+          Capture.captureWindow(tab.windowId);
+          Capture.captureWindow(targetWindowId);
         }
       } else {
-        // Target workspace is closed. Save tab data to its storage
-        const collections = await Storage.readAll();
-        const col = collections.find(c => c.id === collectionId);
-        if (!col) return;
-        col.tabs = col.tabs || [];
-        for (const t of tabs) {
-          col.tabs.push({
-            url: t.url || "",
-            title: t.title || "",
-            pinned: !!t.pinned,
-            focused: false,
-            cookieStoreId: t.cookieStoreId || DEFAULT_CONTAINER
-          });
-        }
-        await browser.storage.local.set({ [STORAGE_KEY]: collections });
-        try {
-          await browser.tabs.remove(tabs.map(t => t.id));
-        } catch (e) {
-          console.error("Failed to remove tabs after move:", e);
+        // Check if target workspace has hidden tabs (inactive but present in window)
+        const hiddenTabIds = State.getTabsForWorkspace(collectionId);
+        if (hiddenTabIds.length > 0) {
+          // Target workspace is inactive with hidden tabs. Hide moved tabs and reassign ownership.
+          State.acquireLock(tab.windowId);
+          try {
+            // If the active tab is among those being moved, activate the
+            // nearest preceding tab that isn't being moved. Firefox refuses
+            // to hide the active tab.
+            const movingSet = new Set(tabIds);
+            const activeTab = tabs.find(t => t.active);
+            if (activeTab) {
+              const allTabs = await browser.tabs.query({ windowId: tab.windowId, hidden: false });
+              const activeIdx = allTabs.findIndex(t => t.id === activeTab.id);
+              let replacement = null;
+              for (let i = activeIdx - 1; i >= 0; i--) {
+                if (!movingSet.has(allTabs[i].id)) { replacement = allTabs[i]; break; }
+              }
+              if (!replacement) {
+                for (let i = activeIdx + 1; i < allTabs.length; i++) {
+                  if (!movingSet.has(allTabs[i].id)) { replacement = allTabs[i]; break; }
+                }
+              }
+              if (replacement) {
+                await browser.tabs.update(replacement.id, { active: true });
+              }
+            }
+            for (const id of tabIds) {
+              State.assignTab(id, collectionId);
+            }
+            await browser.tabs.hide(tabIds);
+            // Move hidden tabs to end so they appear last when target workspace is shown
+            await browser.tabs.move(tabIds, { index: -1 });
+          } catch (e) {
+            console.error("Failed to hide tabs:", e);
+          } finally {
+            State.releaseLock(tab.windowId);
+            Capture.captureWindow(tab.windowId);
+          }
+        } else {
+          // Target workspace is fully closed. Save tab data to its storage
+          const collections = await Storage.readAll();
+          const col = collections.find(c => c.id === collectionId);
+          if (!col) return;
+          col.tabs = col.tabs || [];
+          for (const t of tabs) {
+            col.tabs.push({
+              url: t.url || "",
+              title: t.title || "",
+              pinned: !!t.pinned,
+              focused: false,
+              cookieStoreId: t.cookieStoreId || DEFAULT_CONTAINER
+            });
+          }
+          await browser.storage.local.set({ [STORAGE_KEY]: collections });
+          try {
+            await browser.tabs.remove(tabs.map(t => t.id));
+          } catch (e) {
+            console.error("Failed to remove tabs after move:", e);
+          }
         }
       }
     });
