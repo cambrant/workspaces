@@ -368,6 +368,7 @@ const Menus = {
             for (const id of tabIds) {
               State.assignTab(id, collectionId);
             }
+            await Restore.ungroupTabs(tabIds);
             await browser.tabs.hide(tabIds);
             // Move hidden tabs to end so they appear last when target workspace is shown
             await browser.tabs.move(tabIds, { index: -1 });
@@ -546,11 +547,15 @@ const Restore = {
 
     try {
       // Phase 1: Show or create target workspace's tabs
-      const targetTabIds = State.getTabsForWorkspace(collection.id);
+      const targetTabIds = await this._getWorkspaceTabIds(windowId, collection.id, true);
 
       if (targetTabIds.length > 0) {
         // Target has hidden tabs. Show them
         await browser.tabs.show(targetTabIds);
+        if (typeof browser.tabGroups !== "undefined" && browser.tabs.group &&
+            collection.groups && collection.groups.length > 0) {
+          await this._restoreGroups(windowId, collection.groups, targetTabIds);
+        }
         const activeTabId = State.getActiveTab(collection.id);
         if (activeTabId && targetTabIds.includes(activeTabId)) {
           await browser.tabs.update(activeTabId, { active: true });
@@ -584,6 +589,7 @@ const Restore = {
 
       // Phase 2: Hide or remove previous visible tabs
       if (currentWsId && prevVisibleIds.length > 0) {
+        await this.ungroupTabs(prevVisibleIds);
         await browser.tabs.hide(prevVisibleIds);
       } else if (!currentWsId && prevVisibleIds.length > 0) {
         await browser.tabs.remove(prevVisibleIds);
@@ -618,6 +624,24 @@ const Restore = {
       State.releaseLock(windowId);
       await Capture.captureWindow(windowId);
     }
+  },
+
+  async ungroupTabs(tabIds) {
+    if (!tabIds.length || typeof browser.tabs.ungroup !== "function") return;
+    try {
+      await browser.tabs.ungroup(tabIds);
+    } catch (e) {
+      console.error("Ungrouping tabs failed:", e);
+    }
+  },
+
+  async _getWorkspaceTabIds(windowId, workspaceId, hidden) {
+    const query = { windowId };
+    if (typeof hidden === "boolean") query.hidden = hidden;
+    const tabs = await browser.tabs.query(query);
+    return tabs
+      .filter(tab => State.tabOwnership.get(tab.id) === workspaceId)
+      .map(tab => tab.id);
   },
 
   async _createTab(windowId, tabData, index) {

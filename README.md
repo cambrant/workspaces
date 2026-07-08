@@ -28,6 +28,11 @@ When a workspace is opened in a window (`Restore.switchInWindow`):
 2. If the target workspace has hidden tabs still in memory, they are **shown**. Otherwise, tabs are **recreated** from the stored data.
 3. The window-to-workspace link is updated in both `State` and storage.
 
+When tab groups are available, group definitions are saved with each workspace,
+but only the active workspace's visible tabs stay grouped in Firefox. Inactive
+workspace tabs are ungrouped before being hidden so their group headers do not
+linger in the browser's tab list.
+
 A per-window lock prevents tab event listeners from capturing intermediate state
 during the switch.
 
