@@ -8,6 +8,7 @@ const HEX_COLOR_RE = /^#([A-Fa-f0-9]{3}){1,2}$/;
 const DEFAULT_COLOR = "#808080";
 const KEEP_ALIVE_KEY = "keepAliveCount";
 const DEFAULT_KEEP_ALIVE = 10;
+const PENDING_SWITCH_KEY = "_pendingSwitch";
 
 // Utility functions
 
@@ -68,6 +69,34 @@ const Storage = {
 
   async bulkOverwrite(collections) {
     await browser.storage.local.set({ [STORAGE_KEY]: collections });
+  },
+
+  // Switch-intent journal. switchInWindow writes an entry (keyed by windowId)
+  // before it mutates any tabs and clears it on clean completion. A mid-switch
+  // teardown (crash, disable, upgrade) skips the clear, so the entry survives
+  // for hydrate() to reconcile. Kept in storage.local — not session — so it
+  // outlives a disable/enable cycle that wipes session storage.
+  async _getPendingSwitches() {
+    try {
+      const data = await browser.storage.local.get(PENDING_SWITCH_KEY);
+      return data[PENDING_SWITCH_KEY] || {};
+    } catch (e) {
+      return {};
+    }
+  },
+
+  async _setPendingSwitch(windowId, from, to) {
+    const cur = await this._getPendingSwitches();
+    cur[windowId] = { from: from || null, to };
+    await browser.storage.local.set({ [PENDING_SWITCH_KEY]: cur });
+  },
+
+  async _clearPendingSwitch(windowId) {
+    const cur = await this._getPendingSwitches();
+    if (windowId in cur) {
+      delete cur[windowId];
+      await browser.storage.local.set({ [PENDING_SWITCH_KEY]: cur });
+    }
   }
 };
 
@@ -726,6 +755,14 @@ const Restore = {
     const prevVisible = await browser.tabs.query({ windowId, hidden: false });
     const prevVisibleIds = prevVisible.map(t => t.id);
 
+    // Journal the switch intent durably before touching any tabs. If the page
+    // is torn down mid-switch (crash, disable, upgrade) the finally block never
+    // runs, so this marker survives and hydrate() uses it to disambiguate which
+    // workspace the window actually ended up showing — otherwise the ownership
+    // rebuild would attribute the new workspace's visible tabs to the old
+    // collection and captureWindow would duplicate them across both.
+    await Storage._setPendingSwitch(windowId, currentWsId, collection.id);
+
     State.acquireLock(windowId);
     ContainerEnforcer.setSwitching(true);
     let freshlyCreated = false;
@@ -807,6 +844,8 @@ const Restore = {
       }
       ContainerEnforcer.setSwitching(false);
       State.releaseLock(windowId);
+      // Switch completed cleanly; drop the recovery marker before capturing.
+      await Storage._clearPendingSwitch(windowId);
       await Capture.captureWindow(windowId);
       // Trim the workspace we just left down to its warm set.
       if (currentWsId) Discarder.enforce(currentWsId).catch(() => {});
@@ -977,7 +1016,14 @@ browser.windows.onCreated.addListener(async (win) => {
       }
     }
 
-    if (bestCol && bestScore >= 0.5) {
+    // Re-check and commit the link with no await in between: onCreated fires
+    // for every window restored at once, so two handlers can reach here with
+    // the same bestCol. A synchronous guard + State.link is atomic against the
+    // other handlers, preventing two windows mapping to one workspace (which
+    // corrupts captures) or the same collection being claimed twice.
+    if (bestCol && bestScore >= 0.5 &&
+        State.lookup(win.id) === null &&
+        State.getWindowForCollection(bestCol.id) === null) {
       State.link(win.id, bestCol.id);
       const all = await Storage.readAll();
       const col = all.find(c => c.id === bestCol.id);
@@ -1003,6 +1049,10 @@ browser.windows.onCreated.addListener(async (win) => {
   const defaultCol = collections.find(c => c.id === defaultWsId);
   if (!defaultCol) return;
   if (State.getWindowForCollection(defaultWsId) !== null) return;
+
+  // Only claim a genuinely empty window; a window with real (or still-loading)
+  // content that merely failed to match a saved workspace must not be clobbered.
+  if (!(await windowLooksEmpty(win.id))) return;
 
   await Restore.switchInWindow(win.id, defaultCol);
 });
@@ -1162,6 +1212,13 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
     }
 
     case "resyncAfterRestore": {
+      // A restore replaces every collection with fresh ids, so all in-memory
+      // and session state now references deleted workspaces. Wipe both and the
+      // switch journal, then rehydrate cold — otherwise tab ownership keeps
+      // pointing at phantom workspace ids that the Janitor never reaps.
+      State.reset();
+      try { await browser.storage.session.remove("_state"); } catch (e) { /* ignore */ }
+      await browser.storage.local.remove(PENDING_SWITCH_KEY);
       await hydrate();
       return { ok: true };
     }
@@ -1301,6 +1358,100 @@ const ContainerEnforcer = {
 // Initialization
 
 let _hydrating = false;
+let _startupPending = false;
+
+// A window is "empty" when none of its visible tabs point at real content —
+// only new-tab / blank placeholders. Used to gate auto-open of the default
+// workspace so it never removes a window's real (or still-restoring) tabs.
+async function windowLooksEmpty(windowId) {
+  try {
+    const vis = await browser.tabs.query({ windowId, hidden: false });
+    return !vis.some(t => t.url && t.url !== "about:blank" && !isNewTabUrl(t.url));
+  } catch (e) {
+    return false;
+  }
+}
+
+// Recover from a switch that a mid-operation teardown left half-applied. The
+// journal (see Storage._setPendingSwitch) names the window plus its `from` and
+// `to` workspaces, but not how far the switch got. We resolve that by scoring
+// the window's actual visible-tab URLs against each candidate's saved tabs:
+// whichever it matches is the workspace it truly shows. We then repoint the
+// window to that workspace in both State.windowMap and storage, detaching the
+// other candidate — so the subsequent ownership rebuild attributes the visible
+// tabs correctly instead of duplicating them into the wrong collection.
+//
+// Mutates `collections` in place; returns true if anything changed. Windows no
+// longer present (e.g. after a browser restart, which mints new window Ids and
+// leaves the stale journal keys unmatched) are skipped and their entries
+// dropped when the journal is cleared below.
+async function reconcileInterruptedSwitches(collections, windowIds) {
+  const pending = await Storage._getPendingSwitches();
+  const keys = Object.keys(pending);
+  if (keys.length === 0) return false;
+
+  let changed = false;
+  for (const key of keys) {
+    const windowId = Number(key);
+    if (!windowIds.has(windowId)) continue;
+
+    const { from, to } = pending[key];
+
+    let visible;
+    try {
+      visible = await browser.tabs.query({ windowId, hidden: false });
+    } catch (e) {
+      continue;
+    }
+    const urls = new Set(visible.map(t => t.url).filter(u => u && !isNewTabUrl(u)));
+
+    const score = wsId => {
+      if (!wsId) return 0;
+      const col = collections.find(c => c.id === wsId);
+      if (!col) return 0;
+      const saved = (col.tabs || []).map(t => t.url).filter(u => u && !isNewTabUrl(u));
+      if (saved.length === 0) return 0;
+      return saved.filter(u => urls.has(u)).length / saved.length;
+    };
+
+    const toScore = score(to);
+    const fromScore = score(from);
+
+    // Pick the workspace the window is actually showing. Ties favour `to` (the
+    // intended target). Require a real match; if neither matches, leave the
+    // window unlinked so a stale capture can't clobber either collection.
+    let winner = null;
+    if (toScore >= 0.5 && toScore >= fromScore) winner = to;
+    else if (fromScore >= 0.5) winner = from;
+
+    // Detach both candidates from this window first.
+    for (const wsId of [from, to]) {
+      if (!wsId) continue;
+      const col = collections.find(c => c.id === wsId);
+      if (col && col.windowId === windowId) {
+        col.windowId = null;
+        changed = true;
+      }
+      if (State.windowMap.get(windowId) === wsId) {
+        State.windowMap.delete(windowId);
+        changed = true;
+      }
+    }
+
+    if (winner) {
+      const col = collections.find(c => c.id === winner);
+      if (col) {
+        col.windowId = windowId;
+        State.windowMap.set(windowId, winner);
+        EventBus.emit("windowLinked", { windowId, collectionId: winner });
+        changed = true;
+      }
+    }
+  }
+
+  await browser.storage.local.remove(PENDING_SWITCH_KEY);
+  return changed;
+}
 
 async function hydrate() {
   if (_hydrating) return;
@@ -1334,7 +1485,13 @@ async function hydrate() {
       }
     }
 
-    if (changed) {
+    // Reconcile any switch a mid-operation teardown left half-applied, before
+    // deriving ownership from windowMap — this may repoint a window from the old
+    // collection to the new one (or back) based on what tabs are really visible,
+    // so the rebuild below can't misattribute them and duplicate across both.
+    const reconcileChanged = await reconcileInterruptedSwitches(collections, windowIds);
+
+    if (changed || reconcileChanged) {
       await browser.storage.local.set({ [STORAGE_KEY]: collections });
     }
 
@@ -1377,11 +1534,16 @@ async function hydrate() {
       State.activeTabMap.clear();
       State.previousWorkspaceMap.clear();
 
-      // Clean orphaned hidden tabs only on cold start
+      // Clean orphaned hidden tabs only on cold start. Ownership was just
+      // rebuilt from visible tabs, so any hidden tab is unowned here; removing
+      // them stops a later workspace open from recreating its tabs from storage
+      // alongside a stale hidden copy (which duplicates them). Tabs the browser
+      // restores after this pass are caught by the Janitor's unowned sweep.
       for (const win of windows) {
         const hiddenTabs = await browser.tabs.query({ windowId: win.id, hidden: true });
-        if (hiddenTabs.length > 0) {
-          try { await browser.tabs.remove(hiddenTabs.map(t => t.id)); } catch (e) { /* gone */ }
+        const orphans = hiddenTabs.filter(t => !State.tabOwnership.has(t.id)).map(t => t.id);
+        if (orphans.length > 0) {
+          try { await browser.tabs.remove(orphans); } catch (e) { /* gone */ }
         }
       }
 
@@ -1478,15 +1640,22 @@ async function hydrate() {
         EventBus.emit("windowLinked", { windowId: win.id, collectionId: id });
         await Menus.rebuild();
       }
-    } else {
-      // Auto-open default workspace in unlinked windows
+    } else if (!_startupPending) {
+      // Auto-open default workspace in an empty unlinked window. Skipped during
+      // browser startup: session restore is still materializing windows, so the
+      // windows.onCreated handler (which waits for each window to settle) opens
+      // the default there instead. Only genuinely empty windows are eligible, so
+      // an unmatched or still-loading restored window is never clobbered.
       const { [DEFAULT_WS_KEY]: defaultWsId } = await browser.storage.local.get(DEFAULT_WS_KEY);
       if (defaultWsId) {
         const defaultCol = collections.find(c => c.id === defaultWsId);
         if (defaultCol && State.getWindowForCollection(defaultWsId) === null) {
           const unlinkedWindows = windows.filter(w => !State.lookup(w.id));
-          if (unlinkedWindows.length > 0) {
-            await Restore.switchInWindow(unlinkedWindows[0].id, defaultCol);
+          for (const w of unlinkedWindows) {
+            if (await windowLooksEmpty(w.id)) {
+              await Restore.switchInWindow(w.id, defaultCol);
+              break;
+            }
           }
         }
       }
@@ -1505,8 +1674,11 @@ ContainerEnforcer.init();
 // Hydrate on all three triggers. Handlers gate on the initial hydration so a
 // hotkey or message arriving right after an event-page restart can't run
 // against empty state (which would recreate whole workspaces as duplicates).
-browser.runtime.onStartup.addListener(hydrate);
-browser.runtime.onInstalled.addListener(hydrate);
+// onStartup fires only on browser start (not extension reload). Flag it so the
+// initial hydrate defers default-open to the settle-aware windows.onCreated
+// handler instead of racing session restore.
+browser.runtime.onStartup.addListener(() => { _startupPending = true; return hydrate(); });
+browser.runtime.onInstalled.addListener(() => hydrate());
 const hydrated = hydrate().catch(e => console.error("Initial hydrate failed:", e));
 
 // Alarm keepalive: prevents event page suspension; doubles as the janitor tick
