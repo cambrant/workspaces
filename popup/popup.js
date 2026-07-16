@@ -16,6 +16,7 @@ let currentWindowId = null;
 let windowMap = {};
 let defaultWorkspace = null;
 let containers = [];
+let keepAliveCount = 10;
 let formMode = null;    // "new" | "capture" | "edit"
 let editingId = null;
 let selectedColor = COLORS[5].hex; // blue default
@@ -46,6 +47,7 @@ async function loadState() {
   windowMap = state.windowMap || {};
   defaultWorkspace = state.defaultWorkspace || null;
   containers = state.containers || [];
+  if (Number.isInteger(state.keepAliveCount)) keepAliveCount = state.keepAliveCount;
 }
 
 // Status
@@ -334,10 +336,23 @@ function renderContainerPicker(selectedStoreId) {
 function showListView() {
   document.getElementById("list-view").classList.remove("hidden");
   document.getElementById("form-view").classList.add("hidden");
+  document.getElementById("settings-view").classList.add("hidden");
+}
+
+function showSettingsView() {
+  document.getElementById("list-view").classList.add("hidden");
+  document.getElementById("form-view").classList.add("hidden");
+  document.getElementById("settings-view").classList.remove("hidden");
+
+  const input = document.getElementById("input-keepalive");
+  input.value = keepAliveCount;
+  input.focus();
+  input.select();
 }
 
 function showFormView(mode, col) {
   document.getElementById("list-view").classList.add("hidden");
+  document.getElementById("settings-view").classList.add("hidden");
   document.getElementById("form-view").classList.remove("hidden");
 
   formMode = mode;
@@ -410,6 +425,24 @@ function setupEventListeners() {
   document.getElementById("opt-capture").addEventListener("click", () => {
     document.getElementById("options-dropdown").classList.add("hidden");
     showFormView("capture");
+  });
+
+  // Option: Settings
+  document.getElementById("opt-settings").addEventListener("click", () => {
+    document.getElementById("options-dropdown").classList.add("hidden");
+    showSettingsView();
+  });
+
+  // Settings: Cancel
+  document.getElementById("btn-settings-cancel").addEventListener("click", showListView);
+
+  // Settings: Save
+  document.getElementById("btn-settings-save").addEventListener("click", handleSettingsSave);
+
+  // Settings: Enter/Escape on input
+  document.getElementById("input-keepalive").addEventListener("keydown", e => {
+    if (e.key === "Enter") handleSettingsSave();
+    if (e.key === "Escape") showListView();
   });
 
   // Option: Export
@@ -551,6 +584,17 @@ async function handleFormSubmit() {
     });
     window.close();
   }
+}
+
+async function handleSettingsSave() {
+  const input = document.getElementById("input-keepalive");
+  let n = parseInt(input.value, 10);
+  if (!Number.isInteger(n) || n < 0) n = 0;
+  if (n > 999) n = 999;
+
+  const result = await browser.runtime.sendMessage({ type: "setKeepAliveCount", count: n });
+  if (result && result.ok) keepAliveCount = result.keepAliveCount;
+  showListView();
 }
 
 // Export

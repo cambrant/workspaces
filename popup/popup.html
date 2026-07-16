@@ -25,6 +25,7 @@
           </button>
           <div id="options-dropdown" class="dropdown hidden">
             <button id="opt-capture">Save tabs to workspace</button>
+            <button id="opt-settings">Settings</button>
             <button id="opt-export">Export</button>
             <button id="opt-restore">Restore from backup</button>
           </div>
@@ -68,6 +69,27 @@
       <div class="form-actions">
         <button id="btn-cancel" class="btn-secondary">Cancel</button>
         <button id="btn-confirm" class="btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings view -->
+  <div id="settings-view" class="hidden">
+    <div class="form-header">
+      <h2>Settings</h2>
+    </div>
+    <div class="form-body">
+      <label for="input-keepalive">Tabs kept loaded per workspace</label>
+      <input type="number" id="input-keepalive" min="0" max="999" step="1" autocomplete="off">
+      <p class="form-hint">
+        The most recently used tabs in each workspace stay in memory for instant
+        switching. Older tabs are unloaded (kept, but reloaded when reopened).
+        Set 0 to unload everything except active and pinned tabs.
+      </p>
+
+      <div class="form-actions">
+        <button id="btn-settings-cancel" class="btn-secondary">Cancel</button>
+        <button id="btn-settings-save" class="btn-primary">Save</button>
       </div>
     </div>
   </div>

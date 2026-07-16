@@ -6,6 +6,8 @@ const DEFAULT_CONTAINER = "firefox-default";
 const NEW_TAB_URL = "about:newtab";
 const HEX_COLOR_RE = /^#([A-Fa-f0-9]{3}){1,2}$/;
 const DEFAULT_COLOR = "#808080";
+const KEEP_ALIVE_KEY = "keepAliveCount";
+const DEFAULT_KEEP_ALIVE = 10;
 
 // Utility functions
 
@@ -99,16 +101,29 @@ const State = {
   tabOwnership: new Map(),
   activeTabMap: new Map(),
   previousWorkspaceMap: new Map(),
+  tabRecency: new Map(),
+  _recencyTick: 0,
 
+  _persistTimer: null,
+
+  // Trailing-edge debounce: callers hit this on every tab activation and
+  // create/remove, and session storage only needs eventual consistency for
+  // wake restore.
   _persist() {
-    browser.storage.session.set({
-      _state: {
-        windowMap: Object.fromEntries(this.windowMap),
-        tabOwnership: Object.fromEntries(this.tabOwnership),
-        activeTabMap: Object.fromEntries(this.activeTabMap),
-        previousWorkspaceMap: Object.fromEntries(this.previousWorkspaceMap)
-      }
-    }).catch(() => {});
+    if (this._persistTimer) return;
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      browser.storage.session.set({
+        _state: {
+          windowMap: Object.fromEntries(this.windowMap),
+          tabOwnership: Object.fromEntries(this.tabOwnership),
+          activeTabMap: Object.fromEntries(this.activeTabMap),
+          previousWorkspaceMap: Object.fromEntries(this.previousWorkspaceMap),
+          tabRecency: Object.fromEntries(this.tabRecency),
+          recencyTick: this._recencyTick
+        }
+      }).catch(() => {});
+    }, 250);
   },
 
   async _loadFromSession() {
@@ -123,6 +138,9 @@ const State = {
         this.activeTabMap = new Map(Object.entries(_state.activeTabMap));
       if (_state.previousWorkspaceMap)
         this.previousWorkspaceMap = new Map(Object.entries(_state.previousWorkspaceMap).map(([k, v]) => [Number(k), v]));
+      if (_state.tabRecency)
+        this.tabRecency = new Map(Object.entries(_state.tabRecency).map(([k, v]) => [Number(k), v]));
+      this._recencyTick = Number(_state.recencyTick) || 0;
       return true;
     } catch (e) {
       return false;
@@ -155,6 +173,19 @@ const State = {
     this.tabOwnership.clear();
     this.activeTabMap.clear();
     this.previousWorkspaceMap.clear();
+    this.tabRecency.clear();
+    this._recencyTick = 0;
+  },
+
+  // Bump a tab to the front of the recency order. Called on activation.
+  touchTab(tabId) {
+    this._recencyTick += 1;
+    this.tabRecency.set(tabId, this._recencyTick);
+    this._persist();
+  },
+
+  getRecency(tabId) {
+    return this.tabRecency.get(tabId) || 0;
   },
 
   acquireLock(windowId) {
@@ -176,6 +207,7 @@ const State = {
 
   unassignTab(tabId) {
     this.tabOwnership.delete(tabId);
+    this.tabRecency.delete(tabId);
     this._persist();
   },
 
@@ -298,6 +330,7 @@ const Menus = {
   init() {
     browser.menus.onClicked.addListener(async (info, tab) => {
       if (!info.menuItemId.startsWith("move-tab-") || info.menuItemId === "move-tab-root") return;
+      await hydrated;
 
       const collectionId = info.menuItemId.replace("move-tab-", "");
       const targetWindowId = State.getWindowForCollection(collectionId);
@@ -408,6 +441,22 @@ const Menus = {
 // Tab capture
 
 const Capture = {
+  _timers: new Map(),
+  DEBOUNCE_MS: 500,
+
+  // Trailing-edge debounce per window: tab events arrive in bursts and
+  // captureWindow does a full read-modify-write of all collections.
+  schedule(windowId) {
+    if (!windowId) return;
+    const existing = this._timers.get(windowId);
+    if (existing) clearTimeout(existing);
+    const t = setTimeout(() => {
+      this._timers.delete(windowId);
+      this.captureWindow(windowId).catch(() => {});
+    }, this.DEBOUNCE_MS);
+    this._timers.set(windowId, t);
+  },
+
   async captureWindow(windowId) {
     if (State.isLocked(windowId)) return;
 
@@ -473,45 +522,167 @@ const Capture = {
         if (wsId && !State.isLocked(tab.windowId)) {
           State.assignTab(tab.id, wsId);
         }
-        this.captureWindow(tab.windowId);
+        this.schedule(tab.windowId);
       }
     });
 
-    browser.tabs.onUpdated.addListener((_tabId, _changeInfo, tab) => {
-      if (tab && tab.windowId) this.captureWindow(tab.windowId);
+    // Only these properties change what captureWindow stores; ignoring the
+    // rest keeps favicon/status/discard churn from hammering storage.
+    browser.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+      if (!("url" in changeInfo) && !("title" in changeInfo) &&
+          !("pinned" in changeInfo) && !("groupId" in changeInfo)) return;
+      if (tab && tab.windowId) this.schedule(tab.windowId);
     });
 
     browser.tabs.onMoved.addListener((_tabId, moveInfo) => {
-      if (moveInfo.windowId) this.captureWindow(moveInfo.windowId);
+      if (moveInfo.windowId) this.schedule(moveInfo.windowId);
     });
 
+    // A locked window means an extension-driven move (workspace switch,
+    // context-menu move, adoption) that assigns ownership itself; the
+    // automatic reassign here would clobber it.
     browser.tabs.onAttached.addListener((_tabId, attachInfo) => {
-      if (attachInfo.newWindowId) {
+      if (!attachInfo.newWindowId) return;
+      if (!State.isLocked(attachInfo.newWindowId)) {
         const wsId = State.lookup(attachInfo.newWindowId);
         if (wsId) State.assignTab(_tabId, wsId);
-        this.captureWindow(attachInfo.newWindowId);
       }
+      this.schedule(attachInfo.newWindowId);
     });
 
     browser.tabs.onDetached.addListener((_tabId, detachInfo) => {
+      if (detachInfo.oldWindowId && State.isLocked(detachInfo.oldWindowId)) return;
       State.unassignTab(_tabId);
-      if (detachInfo.oldWindowId) this.captureWindow(detachInfo.oldWindowId);
+      if (detachInfo.oldWindowId) this.schedule(detachInfo.oldWindowId);
     });
 
     browser.tabs.onActivated.addListener(activeInfo => {
-      if (activeInfo.windowId) this.captureWindow(activeInfo.windowId);
+      if (activeInfo.tabId) State.touchTab(activeInfo.tabId);
+      if (activeInfo.windowId) {
+        const wsId = State.lookup(activeInfo.windowId);
+        if (wsId) Discarder.schedule(wsId);
+        this.schedule(activeInfo.windowId);
+      }
     });
 
     browser.tabs.onRemoved.addListener((_tabId, removeInfo) => {
       State.unassignTab(_tabId);
       if (removeInfo.isWindowClosing) return;
-      if (removeInfo.windowId) this.captureWindow(removeInfo.windowId);
+      if (removeInfo.windowId) this.schedule(removeInfo.windowId);
     });
 
     if (typeof browser.tabGroups !== "undefined" && browser.tabGroups.onUpdated) {
       browser.tabGroups.onUpdated.addListener(group => {
-        if (group.windowId) this.captureWindow(group.windowId);
+        if (group.windowId) this.schedule(group.windowId);
       });
+    }
+  }
+};
+
+// Selective tab discarding
+//
+// Each workspace keeps its N most-recently-active tabs loaded (warm) and
+// discards the rest to free memory. N defaults to DEFAULT_KEEP_ALIVE and is
+// overridable via the KEEP_ALIVE_KEY storage setting. Discarding preserves the
+// tab id, so State.tabOwnership stays valid; showing a discarded tab reloads it
+// from its URL. This does not prevent Firefox's own memory-pressure unloading;
+// it only trims proactively so idle workspaces don't sit fully resident.
+
+const Discarder = {
+  _timers: new Map(),
+
+  async getKeepAlive() {
+    try {
+      const { [KEEP_ALIVE_KEY]: n } = await browser.storage.local.get(KEEP_ALIVE_KEY);
+      const parsed = Number(n);
+      if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+    } catch (e) {
+      // fall through to default
+    }
+    return DEFAULT_KEEP_ALIVE;
+  },
+
+  // Discard a workspace's hidden tabs beyond the N most-recently-active warm
+  // ones. Only hidden tabs are eligible: visible tabs are the user's business
+  // (and Firefox's own unloader). The budget counts warm (non-discarded) tabs
+  // only, so N tabs really stay loaded. Pinned tabs and tabs playing audio
+  // are never discarded, but warm ones still occupy budget slots since they
+  // hold memory either way.
+  async enforce(workspaceId) {
+    if (!workspaceId) return;
+    const keep = await this.getKeepAlive();
+    const ownedIds = new Set(State.getTabsForWorkspace(workspaceId));
+    if (ownedIds.size === 0) return;
+
+    let hidden;
+    try {
+      hidden = await browser.tabs.query({ hidden: true });
+    } catch (e) {
+      return;
+    }
+
+    const warm = hidden.filter(t => ownedIds.has(t.id) && !t.discarded);
+    if (warm.length <= keep) return;
+
+    const ranked = warm
+      .map(t => ({ t, r: State.getRecency(t.id) }))
+      .sort((a, b) => b.r - a.r);
+
+    for (const { t } of ranked.slice(keep)) {
+      if (t.pinned || t.audible) continue;
+      try {
+        await browser.tabs.discard(t.id);
+      } catch (e) {
+        // discard may be refused (e.g. about: pages); ignore
+      }
+    }
+  },
+
+  // Debounced enforce to avoid thrashing on rapid tab flipping.
+  schedule(workspaceId) {
+    if (!workspaceId) return;
+    const existing = this._timers.get(workspaceId);
+    if (existing) clearTimeout(existing);
+    const t = setTimeout(() => {
+      this._timers.delete(workspaceId);
+      this.enforce(workspaceId).catch(() => {});
+    }, 2000);
+    this._timers.set(workspaceId, t);
+  }
+};
+
+// Hidden-tab janitor
+//
+// Hidden tabs are invisible in the UI, so anything stranded there leaks
+// silently. Every keepalive tick: remove hidden tabs no workspace owns and
+// re-trim every workspace with owned tabs to its warm budget. Skipped while
+// any window is mid-operation or hydration is running, since both create
+// transient hidden/unowned states.
+
+const Janitor = {
+  _running: false,
+
+  async sweep() {
+    if (this._running) return;
+    if (_hydrating) return;
+    if (State.lockSet.size > 0) return;
+    this._running = true;
+    try {
+      const hidden = await browser.tabs.query({ hidden: true });
+
+      const unowned = hidden
+        .filter(t => !State.tabOwnership.has(t.id))
+        .map(t => t.id);
+      if (unowned.length > 0) {
+        try { await browser.tabs.remove(unowned); } catch (e) { /* gone */ }
+      }
+
+      const wsIds = new Set(State.tabOwnership.values());
+      for (const wsId of wsIds) {
+        await Discarder.enforce(wsId);
+      }
+    } finally {
+      this._running = false;
     }
   }
 };
@@ -522,6 +693,20 @@ const Restore = {
   async switchInWindow(windowId, collection) {
     const currentWsId = State.lookup(windowId);
     if (currentWsId === collection.id) return;
+
+    // If the workspace is already open in another live window, focus that
+    // window instead of opening a second copy. Two windows mapped to one
+    // workspace corrupts captures and strands the loser's tabs hidden and
+    // loaded forever.
+    const linkedWindowId = State.getWindowForCollection(collection.id);
+    if (linkedWindowId !== null && linkedWindowId !== windowId) {
+      try {
+        await browser.windows.update(linkedWindowId, { focused: true });
+        return;
+      } catch (e) {
+        State.unlink(linkedWindowId); // stale reference; window is gone
+      }
+    }
 
     // Track the outgoing workspace as the previous one for this window
     if (currentWsId) {
@@ -547,7 +732,7 @@ const Restore = {
 
     try {
       // Phase 1: Show or create target workspace's tabs
-      const targetTabIds = await this._getWorkspaceTabIds(windowId, collection.id, true);
+      const targetTabIds = await this._adoptWorkspaceTabs(windowId, collection.id);
 
       if (targetTabIds.length > 0) {
         // Target has hidden tabs. Show them
@@ -623,6 +808,8 @@ const Restore = {
       ContainerEnforcer.setSwitching(false);
       State.releaseLock(windowId);
       await Capture.captureWindow(windowId);
+      // Trim the workspace we just left down to its warm set.
+      if (currentWsId) Discarder.enforce(currentWsId).catch(() => {});
     }
   },
 
@@ -635,13 +822,30 @@ const Restore = {
     }
   },
 
-  async _getWorkspaceTabIds(windowId, workspaceId, hidden) {
-    const query = { windowId };
-    if (typeof hidden === "boolean") query.hidden = hidden;
-    const tabs = await browser.tabs.query(query);
-    return tabs
-      .filter(tab => State.tabOwnership.get(tab.id) === workspaceId)
-      .map(tab => tab.id);
+  // Collect the workspace's hidden tabs wherever they live. Tabs stranded in
+  // other windows (from a past duplicate-open or crash) are moved into this
+  // window, so switching adopts an existing set instead of recreating it from
+  // storage — recreation leaks the old set as hidden, loaded orphans.
+  async _adoptWorkspaceTabs(windowId, workspaceId) {
+    const allHidden = await browser.tabs.query({ hidden: true });
+    const owned = allHidden.filter(t => State.tabOwnership.get(t.id) === workspaceId);
+    const tabIds = owned.filter(t => t.windowId === windowId).map(t => t.id);
+    const foreign = owned.filter(t => t.windowId !== windowId);
+    if (foreign.length === 0) return tabIds;
+
+    const foreignWindows = new Set(foreign.map(t => t.windowId));
+    for (const wid of foreignWindows) State.acquireLock(wid);
+    try {
+      const ids = foreign.map(t => t.id);
+      await browser.tabs.move(ids, { windowId, index: -1 });
+      for (const id of ids) State.assignTab(id, workspaceId);
+      tabIds.push(...ids);
+    } catch (e) {
+      console.error("Adopting workspace tabs failed:", e);
+    } finally {
+      for (const wid of foreignWindows) State.releaseLock(wid);
+    }
+    return tabIds;
   },
 
   async _createTab(windowId, tabData, index) {
@@ -664,11 +868,12 @@ const Restore = {
       props.url = url;
     }
 
-    if (shouldDiscard) {
-      // FIXME: Discarding is disabled for now, as an experiment. Turn back on
-      // if this causes performance issues.
-      // props.discarded = true;
-      // props.title = tabData.title || "";
+    // Restore non-focused, non-pinned tabs unloaded so a freshly-opened
+    // workspace only loads its active tab. Firefox rejects `discarded` without
+    // a URL, so skip newtab pages (props.url is unset for those).
+    if (shouldDiscard && props.url) {
+      props.discarded = true;
+      props.title = tabData.title || "";
     }
 
     if (cookieStoreId !== DEFAULT_CONTAINER) {
@@ -724,6 +929,7 @@ const Restore = {
 // Window close handler
 
 browser.windows.onRemoved.addListener(async windowId => {
+  await hydrated;
   const collectionId = State.lookup(windowId);
   if (!collectionId) return;
 
@@ -740,6 +946,7 @@ browser.windows.onRemoved.addListener(async windowId => {
 // Reconnect workspace after browser restart
 
 browser.windows.onCreated.addListener(async (win) => {
+  await hydrated;
   // Let session restore populate the window with tabs
   await new Promise(r => setTimeout(r, 1000));
 
@@ -803,6 +1010,7 @@ browser.windows.onCreated.addListener(async (win) => {
 // Message handler
 
 browser.runtime.onMessage.addListener(async (msg, _sender) => {
+  await hydrated;
   switch (msg.type) {
     case "getState": {
       const collections = await Storage.readAll();
@@ -817,7 +1025,18 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
       } catch (e) {
         // Containers not available
       }
-      return { collections, windowMap, defaultWorkspace: defaultWorkspace || null, containers };
+      const keepAliveCount = await Discarder.getKeepAlive();
+      return { collections, windowMap, defaultWorkspace: defaultWorkspace || null, containers, keepAliveCount };
+    }
+
+    case "setKeepAliveCount": {
+      const n = Number(msg.count);
+      if (!Number.isInteger(n) || n < 0) return { ok: false, error: "Invalid count" };
+      await browser.storage.local.set({ [KEEP_ALIVE_KEY]: n });
+      // Re-trim every workspace that currently has owned tabs.
+      const seen = new Set(State.tabOwnership.values());
+      for (const wsId of seen) Discarder.enforce(wsId).catch(() => {});
+      return { ok: true, keepAliveCount: n };
     }
 
     case "createCollection": {
@@ -955,6 +1174,7 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
 // Keyboard commands
 
 browser.commands.onCommand.addListener(async command => {
+  await hydrated;
   if (command === "switch-to-previous-workspace") {
     const win = await browser.windows.getLastFocused();
     const previousWsId = State.getPreviousWorkspace(win.id);
@@ -1213,6 +1433,12 @@ async function hydrate() {
     State._persist();
     await Menus.rebuild();
 
+    // Trim every workspace with owned tabs down to its warm set on wake.
+    const ownedWorkspaces = new Set(State.tabOwnership.values());
+    for (const wsId of ownedWorkspaces) {
+      await Discarder.enforce(wsId).catch(() => {});
+    }
+
     // First-install setup: create default workspace from current window
     const { _setupDone } = await browser.storage.local.get("_setupDone");
     if (!_setupDone) {
@@ -1276,11 +1502,16 @@ Menus.init();
 Capture.init();
 ContainerEnforcer.init();
 
-// Hydrate on all three triggers
+// Hydrate on all three triggers. Handlers gate on the initial hydration so a
+// hotkey or message arriving right after an event-page restart can't run
+// against empty state (which would recreate whole workspaces as duplicates).
 browser.runtime.onStartup.addListener(hydrate);
 browser.runtime.onInstalled.addListener(hydrate);
-hydrate();
+const hydrated = hydrate().catch(e => console.error("Initial hydrate failed:", e));
 
-// Alarm keepalive: prevents event page suspension
+// Alarm keepalive: prevents event page suspension; doubles as the janitor tick
 browser.alarms.create("keepalive", { periodInMinutes: 0.4 });
-browser.alarms.onAlarm.addListener(() => {});
+browser.alarms.onAlarm.addListener(async () => {
+  await hydrated;
+  Janitor.sweep().catch(() => {});
+});

@@ -353,7 +353,8 @@ h1, h2, h3 {
 
 /* Form view */
 
-#form-view {
+#form-view,
+#settings-view {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -383,7 +384,8 @@ h1, h2, h3 {
   letter-spacing: 0.03em;
 }
 
-.form-body input[type="text"] {
+.form-body input[type="text"],
+.form-body input[type="number"] {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border-color);
@@ -396,9 +398,20 @@ h1, h2, h3 {
   transition: border-color 0.12s;
 }
 
-.form-body input[type="text"]:focus {
+.form-body input[type="text"]:focus,
+.form-body input[type="number"]:focus {
   border-color: var(--primary);
   box-shadow: 0 0 0 2px var(--primary-light);
+}
+
+.form-hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  text-transform: none;
+  letter-spacing: normal;
+  line-height: 1.4;
+  margin-top: -4px;
 }
 
 .form-body select {

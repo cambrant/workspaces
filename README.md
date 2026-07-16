@@ -24,8 +24,8 @@ tracks:
 
 When a workspace is opened in a window (`Restore.switchInWindow`):
 
-1. The current workspace's tabs are captured to storage, then **hidden** (via `browser.tabs.hide`).
-2. If the target workspace has hidden tabs still in memory, they are **shown**. Otherwise, tabs are **recreated** from the stored data.
+1. The current workspace's tabs are captured to storage, then **hidden** (via `browser.tabs.hide`). Afterwards the workspace is trimmed to its warm set (see [Selective tab discarding](#selective-tab-discarding)).
+2. If the target workspace has hidden tabs still in memory, they are **shown**. Otherwise, tabs are **recreated** from the stored data — recreated tabs open **discarded** (unloaded) except the focused one, so a freshly opened workspace only loads its active tab.
 3. The window-to-workspace link is updated in both `State` and storage.
 
 When tab groups are available, group definitions are saved with each workspace,
@@ -93,10 +93,36 @@ checkbox in the edit form.
 ## Session persistence
 
 In-memory state (`windowMap`, `tabOwnership`, `activeTabMap`,
-`previousWorkspaceMap`) is persisted to `browser.storage.session` after every
-mutation. Session storage survives background script suspension but not browser
+`previousWorkspaceMap`, `tabRecency`) is persisted to `browser.storage.session`
+after every mutation. Session storage survives background script suspension but not browser
 restarts. This allows the extension to recover gracefully when Firefox suspends
 the background page without going through a full cold-start rebuild.
+
+## Selective tab discarding
+
+Tabs persist until explicitly closed, but they do not all stay resident in
+memory. Each workspace keeps its **N most-recently-active tabs loaded** (default
+10, set via **Settings** in the popup — stored under the `keepAliveCount`
+storage key) and **discards** the rest via
+`browser.tabs.discard`. Discarding preserves the tab id — `State.tabOwnership`
+stays valid and showing a discarded tab reloads it from its URL — so nothing is
+lost, only unloaded.
+
+Recency is tracked in `State.tabRecency`, a monotonically increasing counter
+bumped on `tabs.onActivated` and persisted to session storage. Active, pinned,
+and already-discarded tabs are never discarded.
+
+Trimming (`Discarder.enforce`) runs:
+
+- after leaving a workspace during a switch (on the outgoing workspace),
+- debounced ~2s after activating a tab (on that tab's workspace),
+- once per workspace on `hydrate()`,
+- on every workspace when `keepAliveCount` changes.
+
+This is **proactive trimming on top of** Firefox's own memory-pressure tab
+unloading — not a replacement for it, and it does not prevent Firefox from
+unloading warm-set tabs under pressure. It only guarantees idle workspaces don't
+sit fully resident.
 
 ## Keepalive
 
