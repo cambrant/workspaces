@@ -38,7 +38,9 @@ during the switch.
 
 When switching to a workspace in an **unmanaged** window (no current workspace),
 the existing tabs are **removed** rather than hidden, since there is no
-workspace to associate them with.
+workspace to associate them with. Before removal, any tabs with real content
+(not new-tab / blank placeholders) are captured into a new `Recovered <date>`
+workspace so nothing is silently lost.
 
 ### Tab capture
 
@@ -72,6 +74,8 @@ letter. Unlinked windows show a grey default icon.
 1. **Session restore**: attempts to load `State` from `browser.storage.session`. If found, this is a **warm wake** (the background script was suspended but the browser session is intact). If not, it's a **cold start**.
 2. **Rebuild windowMap**: iterates stored collections and re-links any that have a `windowId` matching a currently open window. Stale `windowId` references (windows that no longer exist) are cleared.
 3. **Rebuild tabOwnership**: visible tabs in linked windows are assigned to their workspace. On warm wake, hidden-tab ownership is restored from session data (verified against live tabs). On cold start, hidden-tab ownership is lost, so orphaned hidden tabs are removed.
+
+   When a window is matched to a workspace by URL on cold start (in `hydrate` and in `windows.onCreated`), only the visible tabs whose URLs belong to that workspace are claimed. Firefox does not reliably preserve `tabs.hide()` state across a browser restart, so an inactive workspace's tabs can reappear **visible** in the active window; any such tab whose URL matches a *different* saved workspace is removed rather than assigned, so it is not captured into — and duplicated across — the matched workspace. Cold-start ownership is lost anyway, so these tabs are recreated from storage on the next switch to their workspace. Tabs that match no saved workspace (genuinely user-opened) are left untouched.
 4. **Prune stale state** (warm wake only): removes entries from `previousWorkspaceMap` and `activeTabMap` that reference closed windows or deleted workspaces.
 5. **Rebuild context menus**.
 
@@ -126,11 +130,13 @@ sit fully resident.
 
 ## Keepalive
 
-An alarm named `keepalive` fires every 24 seconds (`periodInMinutes: 0.4`). The
-alarm listener is a no-op. Its sole purpose is to prevent Firefox from
-suspending the background script's event page. Without this, Firefox may unload
-the background script after a period of inactivity, which would lose the
-in-memory `State` if session persistence also fails.
+An alarm named `keepalive` fires every 24 seconds (`periodInMinutes: 0.4`). Its
+primary purpose is to prevent Firefox from suspending the background script's
+event page — without it Firefox may unload the background script after a period
+of inactivity, which would lose the in-memory `State` if session persistence
+also fails. The alarm listener doubles as the janitor tick: each fire runs
+`Janitor.sweep()` (skipped while hydrating or any window is mid-operation) to
+reap unowned hidden tabs and re-trim each workspace to its warm set.
 
 ## Keyboard shortcuts
 

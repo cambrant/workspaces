@@ -50,25 +50,59 @@ const Storage = {
     }
   },
 
+  // Serialization chain for the collections array. Every read-modify-write must
+  // run inside runExclusive so no two of them interleave at an await point —
+  // otherwise a block that read a stale array clobbers a write that landed in
+  // between (e.g. a debounced capture reverting a rename). JS is single-threaded
+  // but await yields, so this chain is what actually enforces atomicity.
+  _chain: Promise.resolve(),
+
+  runExclusive(fn) {
+    const run = () => fn();
+    const p = this._chain.then(run, run);
+    // Keep the chain alive regardless of any single block's failure.
+    this._chain = p.then(() => {}, () => {});
+    return p;
+  },
+
+  // Read-modify-write helper: reads the current array *inside* the lock, hands
+  // it to mutator (which mutates it in place), then writes it back. Returns
+  // whatever mutator returns. Do NOT call another Storage write from inside
+  // mutator — the chain would deadlock waiting on itself.
+  updateCollections(mutator) {
+    return this.runExclusive(async () => {
+      const all = await this.readAll();
+      const ret = await mutator(all);
+      await browser.storage.local.set({ [STORAGE_KEY]: all });
+      return ret;
+    });
+  },
+
   async upsert(collection) {
-    const all = await this.readAll();
-    const idx = all.findIndex(c => c.id === collection.id);
-    if (idx >= 0) {
-      all[idx] = collection;
-    } else {
-      all.push(collection);
-    }
-    await browser.storage.local.set({ [STORAGE_KEY]: all });
+    await this.runExclusive(async () => {
+      const all = await this.readAll();
+      const idx = all.findIndex(c => c.id === collection.id);
+      if (idx >= 0) {
+        all[idx] = collection;
+      } else {
+        all.push(collection);
+      }
+      await browser.storage.local.set({ [STORAGE_KEY]: all });
+    });
   },
 
   async delete(id) {
-    const all = await this.readAll();
-    const filtered = all.filter(c => c.id !== id);
-    await browser.storage.local.set({ [STORAGE_KEY]: filtered });
+    await this.runExclusive(async () => {
+      const all = await this.readAll();
+      const filtered = all.filter(c => c.id !== id);
+      await browser.storage.local.set({ [STORAGE_KEY]: filtered });
+    });
   },
 
   async bulkOverwrite(collections) {
-    await browser.storage.local.set({ [STORAGE_KEY]: collections });
+    await this.runExclusive(async () => {
+      await browser.storage.local.set({ [STORAGE_KEY]: collections });
+    });
   },
 
   // Switch-intent journal. switchInWindow writes an entry (keyed by windowId)
@@ -334,7 +368,23 @@ function colorDotIcon(hex) {
 }
 
 const Menus = {
-  async rebuild() {
+  _chain: Promise.resolve(),
+  _queued: false,
+
+  // Coalesce + serialize rebuilds. removeAll() and the create() calls must not
+  // interleave across two concurrent rebuilds, or the second run's create()
+  // hits "ID already exists" and the menu ends up missing items. At most one
+  // rebuild is queued behind the running one — it always reads fresh storage,
+  // so collapsing extra callers loses nothing.
+  rebuild() {
+    if (this._queued) return this._chain;
+    this._queued = true;
+    const run = () => { this._queued = false; return this._doRebuild(); };
+    this._chain = this._chain.then(run, run);
+    return this._chain;
+  },
+
+  async _doRebuild() {
     await browser.menus.removeAll();
 
     const collections = await Storage.readAll();
@@ -442,20 +492,22 @@ const Menus = {
           }
         } else {
           // Target workspace is fully closed. Save tab data to its storage
-          const collections = await Storage.readAll();
-          const col = collections.find(c => c.id === collectionId);
-          if (!col) return;
-          col.tabs = col.tabs || [];
-          for (const t of tabs) {
-            col.tabs.push({
-              url: t.url || "",
-              title: t.title || "",
-              pinned: !!t.pinned,
-              focused: false,
-              cookieStoreId: t.cookieStoreId || DEFAULT_CONTAINER
-            });
-          }
-          await browser.storage.local.set({ [STORAGE_KEY]: collections });
+          const saved = await Storage.updateCollections(collections => {
+            const col = collections.find(c => c.id === collectionId);
+            if (!col) return false;
+            col.tabs = col.tabs || [];
+            for (const t of tabs) {
+              col.tabs.push({
+                url: t.url || "",
+                title: t.title || "",
+                pinned: !!t.pinned,
+                focused: false,
+                cookieStoreId: t.cookieStoreId || DEFAULT_CONTAINER
+              });
+            }
+            return true;
+          });
+          if (!saved) return;
           try {
             await browser.tabs.remove(tabs.map(t => t.id));
           } catch (e) {
@@ -533,15 +585,13 @@ const Capture = {
       }
     }
 
-    const all = await Storage.readAll();
-    const col = all.find(c => c.id === collectionId);
-    if (!col) return;
-
-    col.tabs = tabList;
-    col.groups = groupList;
-    col.windowId = windowId;
-
-    await browser.storage.local.set({ [STORAGE_KEY]: all });
+    await Storage.updateCollections(all => {
+      const col = all.find(c => c.id === collectionId);
+      if (!col) return;
+      col.tabs = tabList;
+      col.groups = groupList;
+      col.windowId = windowId;
+    });
   },
 
   init() {
@@ -776,7 +826,12 @@ const Restore = {
         await browser.tabs.show(targetTabIds);
         if (typeof browser.tabGroups !== "undefined" && browser.tabs.group &&
             collection.groups && collection.groups.length > 0) {
-          await this._restoreGroups(windowId, collection.groups, targetTabIds);
+          // Group defs index into the captured tab order (collection.tabs), but
+          // adopted hidden tabs come back in query order (and foreign ones are
+          // appended). Re-align to capture positions by URL so groups reassemble
+          // with the right members instead of scrambling.
+          const ordered = await this._orderTabsByCapture(targetTabIds, collection.tabs);
+          await this._restoreGroups(windowId, collection.groups, ordered);
         }
         const activeTabId = State.getActiveTab(collection.id);
         if (activeTabId && targetTabIds.includes(activeTabId)) {
@@ -790,15 +845,16 @@ const Restore = {
         const createdTabIds = [];
         const tabList = collection.tabs || [];
 
+        // Keep createdTabIds positionally aligned with tabList (push null on a
+        // failed create) so group defs — which index into capture order — map
+        // to the right tabs. _restoreGroups filters the nulls.
         for (let i = 0; i < tabList.length; i++) {
           const tabId = await this._createTab(windowId, tabList[i], i);
-          if (tabId) {
-            State.assignTab(tabId, collection.id);
-            createdTabIds.push(tabId);
-          }
+          if (tabId) State.assignTab(tabId, collection.id);
+          createdTabIds.push(tabId || null);
         }
 
-        if (createdTabIds.length === 0) {
+        if (!createdTabIds.some(Boolean)) {
           const tab = await browser.tabs.create({ windowId, active: true });
           State.assignTab(tab.id, collection.id);
         }
@@ -814,27 +870,48 @@ const Restore = {
         await this.ungroupTabs(prevVisibleIds);
         await browser.tabs.hide(prevVisibleIds);
       } else if (!currentWsId && prevVisibleIds.length > 0) {
+        // Unmanaged window: its tabs belong to no workspace and would be lost on
+        // removal. Preserve any real content by capturing it into a new
+        // workspace first (placeholder-only windows have nothing worth keeping).
+        const worthKeeping = prevVisible.filter(
+          t => t.url && t.url !== "about:blank" && !isNewTabUrl(t.url)
+        );
+        if (worthKeeping.length > 0) {
+          const recovered = {
+            id: generateId(),
+            name: `Recovered ${new Date().toISOString().slice(0, 10)}`,
+            color: DEFAULT_COLOR,
+            tabs: worthKeeping.map(t => ({
+              url: t.url || "",
+              title: t.title || "",
+              pinned: !!t.pinned,
+              focused: false,
+              cookieStoreId: t.cookieStoreId || DEFAULT_CONTAINER
+            })),
+            groups: [],
+            windowId: null,
+            createdAt: Date.now()
+          };
+          await Storage.upsert(recovered);
+          await Menus.rebuild();
+        }
         await browser.tabs.remove(prevVisibleIds);
       }
 
       // Phase 3: Update state
       if (currentWsId) {
-        const prev = await Storage.readAll();
-        const currentCol = prev.find(c => c.id === currentWsId);
-        if (currentCol) {
-          currentCol.windowId = null;
-          await browser.storage.local.set({ [STORAGE_KEY]: prev });
-        }
+        await Storage.updateCollections(prev => {
+          const currentCol = prev.find(c => c.id === currentWsId);
+          if (currentCol) currentCol.windowId = null;
+        });
       }
 
       State.link(windowId, collection.id);
 
-      const all = await Storage.readAll();
-      const col = all.find(c => c.id === collection.id);
-      if (col) {
-        col.windowId = windowId;
-        await browser.storage.local.set({ [STORAGE_KEY]: all });
-      }
+      await Storage.updateCollections(all => {
+        const col = all.find(c => c.id === collection.id);
+        if (col) col.windowId = windowId;
+      });
 
       EventBus.emit("collectionOpened", { windowId, collection });
 
@@ -885,6 +962,25 @@ const Restore = {
       for (const wid of foreignWindows) State.releaseLock(wid);
     }
     return tabIds;
+  },
+
+  // Map a set of live tab ids back onto their captured positions by URL, so a
+  // group definition's tabIndices (which reference capture order) resolve to
+  // the correct live tab regardless of the order the tabs came back in.
+  // Returns an array parallel to savedTabs; unmatched positions are null.
+  async _orderTabsByCapture(tabIds, savedTabs) {
+    const saved = savedTabs || [];
+    const live = [];
+    for (const id of tabIds) {
+      try { live.push(await browser.tabs.get(id)); } catch (e) { /* gone */ }
+    }
+    const used = new Set();
+    return saved.map(st => {
+      const wantUrl = st.url || "";
+      const match = live.find(t => !used.has(t.id) && (t.url || "") === wantUrl);
+      if (match) { used.add(match.id); return match.id; }
+      return null;
+    });
   },
 
   async _createTab(windowId, tabData, index) {
@@ -972,12 +1068,10 @@ browser.windows.onRemoved.addListener(async windowId => {
   const collectionId = State.lookup(windowId);
   if (!collectionId) return;
 
-  const all = await Storage.readAll();
-  const col = all.find(c => c.id === collectionId);
-  if (col) {
-    col.windowId = null;
-    await browser.storage.local.set({ [STORAGE_KEY]: all });
-  }
+  await Storage.updateCollections(all => {
+    const col = all.find(c => c.id === collectionId);
+    if (col) col.windowId = null;
+  });
 
   State.unlink(windowId);
 });
@@ -986,8 +1080,8 @@ browser.windows.onRemoved.addListener(async windowId => {
 
 browser.windows.onCreated.addListener(async (win) => {
   await hydrated;
-  // Let session restore populate the window with tabs
-  await new Promise(r => setTimeout(r, 1000));
+  // Let session restore populate the window with tabs and resolve their URLs
+  await waitForTabsSettled(win.id);
 
   // Skip if already managed (by hydrate or extension-initiated open)
   if (State.lookup(win.id)) return;
@@ -1025,16 +1119,21 @@ browser.windows.onCreated.addListener(async (win) => {
         State.lookup(win.id) === null &&
         State.getWindowForCollection(bestCol.id) === null) {
       State.link(win.id, bestCol.id);
-      const all = await Storage.readAll();
-      const col = all.find(c => c.id === bestCol.id);
-      if (col) {
-        col.windowId = win.id;
-        await browser.storage.local.set({ [STORAGE_KEY]: all });
-      }
+      await Storage.updateCollections(all => {
+        const col = all.find(c => c.id === bestCol.id);
+        if (col) col.windowId = win.id;
+      });
+      // Only claim the visible tabs that belong to this workspace. Tabs restored
+      // visible from another workspace (Firefox dropped their hidden flag) are
+      // removed rather than assigned, so they aren't captured into this one.
+      const foreignIds = foreignRestoredTabIds(visibleTabs, bestCol, collections);
       for (const tab of visibleTabs) {
-        State.assignTab(tab.id, bestCol.id);
+        if (!foreignIds.has(tab.id)) State.assignTab(tab.id, bestCol.id);
       }
       EventBus.emit("windowLinked", { windowId: win.id, collectionId: bestCol.id });
+      if (foreignIds.size > 0) {
+        try { await browser.tabs.remove([...foreignIds]); } catch (e) { /* gone */ }
+      }
       return;
     }
   }
@@ -1141,17 +1240,18 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
     }
 
     case "updateMetadata": {
-      const all = await Storage.readAll();
-      const col = all.find(c => c.id === msg.collectionId);
+      const col = await Storage.updateCollections(all => {
+        const c = all.find(c => c.id === msg.collectionId);
+        if (!c) return null;
+        if (msg.name !== undefined) c.name = msg.name;
+        if (msg.color !== undefined) c.color = sanitizeColor(msg.color);
+        if (msg.defaultContainer !== undefined) {
+          c.defaultContainer = msg.defaultContainer || null;
+        }
+        return c;
+      });
       if (!col) return { ok: false };
 
-      if (msg.name !== undefined) col.name = msg.name;
-      if (msg.color !== undefined) col.color = sanitizeColor(msg.color);
-      if (msg.defaultContainer !== undefined) {
-        col.defaultContainer = msg.defaultContainer || null;
-      }
-
-      await browser.storage.local.set({ [STORAGE_KEY]: all });
       EventBus.emit("metadataChanged", { collection: col });
       await Menus.rebuild();
       return { ok: true };
@@ -1190,16 +1290,20 @@ browser.runtime.onMessage.addListener(async (msg, _sender) => {
     }
 
     case "reorderCollections": {
-      const all = await Storage.readAll();
       const { fromIndex, toIndex } = msg;
-      if (fromIndex < 0 || fromIndex >= all.length || toIndex < 0 || toIndex >= all.length) {
-        return { ok: false };
-      }
-      const [item] = all.splice(fromIndex, 1);
-      all.splice(toIndex, 0, item);
-      await browser.storage.local.set({ [STORAGE_KEY]: all });
+      const result = await Storage.runExclusive(async () => {
+        const all = await Storage.readAll();
+        if (fromIndex < 0 || fromIndex >= all.length || toIndex < 0 || toIndex >= all.length) {
+          return { ok: false };
+        }
+        const [item] = all.splice(fromIndex, 1);
+        all.splice(toIndex, 0, item);
+        await browser.storage.local.set({ [STORAGE_KEY]: all });
+        return { ok: true, collections: all };
+      });
+      if (!result.ok) return { ok: false };
       await Menus.rebuild();
-      return { ok: true, collections: all };
+      return result;
     }
 
     case "setDefaultWorkspace": {
@@ -1268,7 +1372,21 @@ const ContainerEnforcer = {
 
   async _redirect(tabId, props, wsId) {
     try {
-      const newTab = await browser.tabs.create(props);
+      let newTab;
+      try {
+        newTab = await browser.tabs.create(props);
+      } catch (e1) {
+        // A stale openerTabId (opener closed meanwhile) rejects the create.
+        // Retry without it rather than dropping the redirect and stranding the
+        // tab in the wrong container.
+        if (props.openerTabId != null) {
+          const retry = { ...props };
+          delete retry.openerTabId;
+          newTab = await browser.tabs.create(retry);
+        } else {
+          throw e1;
+        }
+      }
       State.assignTab(newTab.id, wsId);
       await browser.tabs.remove(tabId);
     } catch (e) {
@@ -1302,6 +1420,7 @@ const ContainerEnforcer = {
           index: tab.index,
           active: tab.active,
           pinned: !!tab.pinned,
+          openerTabId: tab.openerTabId,
           wsId,
           cookieStoreId: col.defaultContainer
         });
@@ -1320,6 +1439,10 @@ const ContainerEnforcer = {
       }
       if (tab.pinned) {
         props.pinned = true;
+      }
+      // Preserve the tab-tree relationship (back-to-opener, tree-style tabs).
+      if (tab.openerTabId != null) {
+        props.openerTabId = tab.openerTabId;
       }
 
       await this._redirect(tab.id, props, wsId);
@@ -1345,6 +1468,9 @@ const ContainerEnforcer = {
       if (pending.pinned) {
         props.pinned = true;
       }
+      if (pending.openerTabId != null) {
+        props.openerTabId = pending.openerTabId;
+      }
 
       await this._redirect(tabId, props, pending.wsId);
     });
@@ -1360,6 +1486,37 @@ const ContainerEnforcer = {
 let _hydrating = false;
 let _startupPending = false;
 
+// Identify visible tabs that session restore brought back from a DIFFERENT
+// workspace than the one this window matched. Firefox does not reliably
+// preserve tabs.hide() state across a browser restart, so an inactive
+// workspace's tabs can reappear *visible* in the active window. Without this,
+// the cold-start matcher assigns and captureWindow persists every visible tab
+// into the matched workspace, copying the other workspace's tabs across both
+// (they even keep the original cookieStoreId). Cold-start ownership is lost, so
+// these are recreated from storage on the next switch — removing them here is
+// consistent with the hidden-orphan cleanup that already runs on cold start.
+//
+// A tab is treated as foreign only when its URL matches some OTHER saved
+// workspace's tabs and does NOT match the matched workspace's — so genuinely
+// user-opened tabs (matching nothing) are left with the window untouched.
+function foreignRestoredTabIds(visibleTabs, matchedCol, collections) {
+  const ownUrls = new Set(
+    (matchedCol.tabs || []).map(t => t.url).filter(u => u && !isNewTabUrl(u))
+  );
+  const otherUrls = new Set();
+  for (const col of collections) {
+    if (col.id === matchedCol.id) continue;
+    for (const t of col.tabs || []) {
+      if (t.url && !isNewTabUrl(t.url)) otherUrls.add(t.url);
+    }
+  }
+  return new Set(
+    visibleTabs
+      .filter(t => t.url && !isNewTabUrl(t.url) && !ownUrls.has(t.url) && otherUrls.has(t.url))
+      .map(t => t.id)
+  );
+}
+
 // A window is "empty" when none of its visible tabs point at real content —
 // only new-tab / blank placeholders. Used to gate auto-open of the default
 // workspace so it never removes a window's real (or still-restoring) tabs.
@@ -1369,6 +1526,29 @@ async function windowLooksEmpty(windowId) {
     return !vis.some(t => t.url && t.url !== "about:blank" && !isNewTabUrl(t.url));
   } catch (e) {
     return false;
+  }
+}
+
+// Wait until a window's visible tabs stop changing — session restore populates
+// tabs and resolves their URLs asynchronously, so a fixed delay either fires
+// too early (URL match / reconnect fails on a slow machine) or wastes time.
+// Polls until no tab is still loading and the URL set is stable across two
+// consecutive checks, capped by maxMs.
+async function waitForTabsSettled(windowId, maxMs = 5000, intervalMs = 200) {
+  const deadline = Date.now() + maxMs;
+  let prevSig = null;
+  while (Date.now() < deadline) {
+    let tabs;
+    try {
+      tabs = await browser.tabs.query({ windowId, hidden: false });
+    } catch (e) {
+      return; // window gone
+    }
+    const loading = tabs.some(t => t.status === "loading" || t.url === "" || t.url === "about:blank");
+    const sig = tabs.map(t => t.url).join("\n");
+    if (!loading && sig === prevSig) return;
+    prevSig = sig;
+    await new Promise(r => setTimeout(r, intervalMs));
   }
 }
 
@@ -1492,7 +1672,7 @@ async function hydrate() {
     const reconcileChanged = await reconcileInterruptedSwitches(collections, windowIds);
 
     if (changed || reconcileChanged) {
-      await browser.storage.local.set({ [STORAGE_KEY]: collections });
+      await Storage.runExclusive(() => browser.storage.local.set({ [STORAGE_KEY]: collections }));
     }
 
     // Rebuild tabOwnership: visible tabs derive from windowMap
@@ -1579,8 +1759,16 @@ async function hydrate() {
           bestCol.windowId = win.id;
           matched = true;
 
+          // Claim only this workspace's own tabs. Tabs restored visible from
+          // another workspace (Firefox dropped their hidden flag on restart)
+          // are removed, not assigned — otherwise captureWindow would copy the
+          // other workspace's tabs into this one.
+          const foreignIds = foreignRestoredTabIds(visibleTabs, bestCol, collections);
           for (const tab of visibleTabs) {
-            State.assignTab(tab.id, bestCol.id);
+            if (!foreignIds.has(tab.id)) State.assignTab(tab.id, bestCol.id);
+          }
+          if (foreignIds.size > 0) {
+            try { await browser.tabs.remove([...foreignIds]); } catch (e) { /* gone */ }
           }
 
           EventBus.emit("windowLinked", { windowId: win.id, collectionId: bestCol.id });
@@ -1588,7 +1776,7 @@ async function hydrate() {
       }
 
       if (matched) {
-        await browser.storage.local.set({ [STORAGE_KEY]: collections });
+        await Storage.runExclusive(() => browser.storage.local.set({ [STORAGE_KEY]: collections }));
       }
     }
 
